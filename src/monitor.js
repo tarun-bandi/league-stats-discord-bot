@@ -127,13 +127,41 @@ function sameApproximateStart(first, second) {
   );
 }
 
-async function riotJson(env, url, { allowNotFound = false } = {}) {
+async function riotJson(
+  env,
+  url,
+  { allowNotFound = false, allowInvalidIdentifier = false } = {},
+) {
   if (!env.RIOT_API_KEY) throw new Error("RIOT_API_KEY is not configured");
   const response = await fetch(url, {
     headers: { "X-Riot-Token": env.RIOT_API_KEY },
   });
   if (allowNotFound && response.status === 404) return null;
-  if (!response.ok) throw new Error(`Riot API failed with HTTP ${response.status}`);
+  if (allowInvalidIdentifier && [400, 404].includes(response.status)) return null;
+  if (!response.ok) {
+    const pathname = new URL(url).pathname;
+    const endpoint = pathname.includes("/accounts/by-puuid/")
+      ? "account-by-puuid"
+      : pathname.includes("/accounts/by-riot-id/")
+        ? "account-by-riot-id"
+        : pathname.includes("/matches/by-puuid/")
+          ? "match-list"
+          : pathname.includes("/lol/match/v5/matches/")
+            ? "match-detail"
+            : pathname.includes("/active-games/by-summoner/")
+              ? "active-game"
+              : "unknown-endpoint";
+    let detail = "";
+    try {
+      const body = await response.clone().json();
+      detail = String(body?.status?.message ?? body?.message ?? "").slice(0, 200);
+    } catch {
+      // Riot did not return a JSON error body.
+    }
+    throw new Error(
+      `Riot API ${endpoint} failed with HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
+    );
+  }
   return response.json();
 }
 
@@ -196,7 +224,7 @@ async function resolveTrackedAccount(env, tracker, detectionMs) {
   let account;
   if (summoner.puuid) {
     const url = `https://${NA_REGION.regional}.api.riotgames.com/riot/account/v1/accounts/by-puuid/${encodeURIComponent(summoner.puuid)}`;
-    account = await riotJson(env, url, { allowNotFound: true });
+    account = await riotJson(env, url, { allowInvalidIdentifier: true });
   }
   if (!account) {
     const riotId = parseRiotId(summoner.riot_id);

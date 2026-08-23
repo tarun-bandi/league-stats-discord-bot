@@ -619,9 +619,17 @@ async function runDeferredCommand(interaction, env) {
 
 export default {
   async scheduled(controller, env) {
-    await runLeagueMonitor(env, {
-      detectionTimestamp: controller.scheduledTime || Date.now(),
-    });
+    try {
+      await runLeagueMonitor(env, {
+        detectionTimestamp: controller.scheduledTime || Date.now(),
+      });
+    } catch (error) {
+      console.error(
+        "League Game Monitor failed",
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
   },
 
   async fetch(request, env, context) {
