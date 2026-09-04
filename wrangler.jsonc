@@ -21,7 +21,11 @@
     "required": [
       "DISCORD_PUBLIC_KEY",
       "RIOT_API_KEY",
-      "DISCORD_WEBHOOK_URL"
+      "DISCORD_WEBHOOK_URL",
+      "DISCORD_BOT_TOKEN",
+      "DISCORD_ALERT_CHANNEL_ID",
+      "DISCORD_ALERT_TRANSPORT",
+      "MONITOR_ENABLED"
     ]
   }
 }

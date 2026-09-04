@@ -9,18 +9,23 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 - One-minute Cloudflare Cron Trigger for three configured NA accounts
 - Riot Match-v5 and Spectator-v5 monitoring
 - D1-backed durable cursors, live-game correlation, and Discord message IDs
-- One Discord alert per game, with live alerts edited when the game completes
+- One Discord alert per game, authored by the LeagueStats bot and edited when the game completes
 - Discord mentions disabled in every response
 
 ## Cloudflare bindings
 
 - `DISCORD_PUBLIC_KEY` — Worker secret used to verify Discord interactions
 - `RIOT_API_KEY` — Worker secret used for Riot API requests
-- `DISCORD_WEBHOOK_URL` — Worker secret used only by the scheduled monitor
+- `DISCORD_BOT_TOKEN` — Worker secret used to create and edit monitor alerts
+- `DISCORD_ALERT_CHANNEL_ID` — destination channel for monitor alerts
+- `DISCORD_ALERT_TRANSPORT` — temporary cutover selector (`webhook` or `bot`)
+- `DISCORD_WEBHOOK_URL` — temporary bridge secret for legacy alerts during cutover
+- `MONITOR_ENABLED` — explicit monitor kill switch; only `true`, `1`, `yes`, or `on` enables checks
 - `MONITOR_DB` — D1 binding containing the authoritative monitor state
 
-The production Cron Trigger is `* * * * *`. The monitor refuses to access Riot
-or Discord when its D1 state is missing, corrupt, or invalid.
+The production Cron Trigger is `* * * * *`. The monitor does not access D1,
+Riot, or Discord while `MONITOR_ENABLED` is false. When enabled, it refuses to
+access Riot or Discord if its D1 state is missing, corrupt, or invalid.
 
 ## Local development
 
@@ -46,3 +51,11 @@ DISCORD_APPLICATION_ID=... DISCORD_BOT_TOKEN_FILE=/secure/path/token \
 ```
 
 The registration script reads the bot token from the file and never prints it.
+
+Before enabling bot-authored monitor alerts, verify channel permissions with a
+temporary create/edit/delete smoke message:
+
+```sh
+DISCORD_ALERT_CHANNEL_ID=... DISCORD_BOT_TOKEN_FILE=/secure/path/token \
+  pnpm smoke:alert
+```

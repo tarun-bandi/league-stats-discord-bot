@@ -1,5 +1,9 @@
 import { COMMANDS, REGION_CHOICES } from "./commands.js";
-import { monitorStatus, runLeagueMonitor } from "./monitor.js";
+import {
+  monitorConfiguration,
+  monitorStatus,
+  runLeagueMonitor,
+} from "./monitor.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const MAX_STATS_MATCHES = 30;
@@ -657,9 +661,7 @@ export default {
         } catch {
           return json(
             {
-              configured: Boolean(
-                env.MONITOR_DB && env.DISCORD_WEBHOOK_URL && env.RIOT_API_KEY,
-              ),
+              ...monitorConfiguration(env),
               stateValid: false,
             },
             503,
@@ -672,7 +674,7 @@ export default {
         configured: {
           discord: Boolean(env.DISCORD_PUBLIC_KEY),
           riot: Boolean(env.RIOT_API_KEY),
-          monitor: Boolean(env.MONITOR_DB && env.DISCORD_WEBHOOK_URL),
+          monitor: monitorConfiguration(env),
         },
         regions: REGION_CHOICES.map(([name, value]) => ({ name, value })),
       });

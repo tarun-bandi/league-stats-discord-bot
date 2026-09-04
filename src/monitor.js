@@ -1,4 +1,5 @@
 const STATE_KEY = "league-game-monitor";
+const DISCORD_API = "https://discord.com/api/v10";
 const EASTERN_TIME_ZONE = "America/New_York";
 const EMPTY_MENTIONS = { parse: [] };
 const LEASE_MS = 4 * 60 * 1000;
@@ -8,6 +9,8 @@ const NA_REGION = {
   platform: "na1",
   regional: "americas",
 };
+
+const ENABLED_VALUES = new Set(["1", "true", "yes", "on"]);
 
 const QUEUES = {
   0: "Custom",
@@ -85,6 +88,59 @@ export function validateMonitorState(state) {
     validateTracker(tracker, stateKey);
   }
   return state;
+}
+
+export function monitorEnabled(env) {
+  return ENABLED_VALUES.has(String(env.MONITOR_ENABLED ?? "").trim().toLowerCase());
+}
+
+function discordTransport(env) {
+  const transport = String(env.DISCORD_ALERT_TRANSPORT ?? "webhook")
+    .trim()
+    .toLowerCase();
+  if (!["bot", "webhook"].includes(transport)) {
+    throw new Error("DISCORD_ALERT_TRANSPORT must be bot or webhook");
+  }
+  return transport;
+}
+
+function botChannelId(env, override) {
+  const channelId = String(override ?? env.DISCORD_ALERT_CHANNEL_ID ?? "").trim();
+  if (!/^\d+$/.test(channelId)) {
+    throw new Error("DISCORD_ALERT_CHANNEL_ID is not configured");
+  }
+  return channelId;
+}
+
+function requireBotToken(env) {
+  const token = String(env.DISCORD_BOT_TOKEN ?? "").trim();
+  if (!token) throw new Error("DISCORD_BOT_TOKEN is not configured");
+  return token;
+}
+
+function transportConfigured(env, transport) {
+  if (transport === "webhook") return Boolean(env.DISCORD_WEBHOOK_URL);
+  return Boolean(env.DISCORD_BOT_TOKEN && env.DISCORD_ALERT_CHANNEL_ID);
+}
+
+export function monitorConfiguration(env) {
+  let transport;
+  try {
+    transport = discordTransport(env);
+  } catch {
+    return {
+      configured: false,
+      enabled: monitorEnabled(env),
+      transport: "invalid",
+    };
+  }
+  return {
+    configured: Boolean(
+      env.MONITOR_DB && env.RIOT_API_KEY && transportConfigured(env, transport),
+    ),
+    enabled: monitorEnabled(env),
+    transport,
+  };
 }
 
 function queueName(queueId, fallback = "League game") {
@@ -407,6 +463,8 @@ async function completedUpdates(env, tracker, detectionIso) {
       game.record_key = recordKey;
       game.record = record;
       game.patch_message_id = record.discord_message_id ?? null;
+      game.patch_transport = record.discord_transport ?? "webhook";
+      game.patch_channel_id = record.discord_channel_id ?? null;
       continue;
     }
 
@@ -513,8 +571,127 @@ function webhookBase(env) {
   return String(env.DISCORD_WEBHOOK_URL).split("?")[0].replace(/\/$/, "");
 }
 
-async function postDiscord(env, items) {
-  const response = await fetch(`${webhookBase(env)}?wait=true`, {
+async function discordRequest(fetchImpl, url, init, action) {
+  const response = await fetchImpl(url, init);
+  if (!response.ok) {
+    throw new Error(`Discord ${action} failed with HTTP ${response.status}`);
+  }
+  return response;
+}
+
+function botHeaders(env) {
+  return {
+    Authorization: `Bot ${requireBotToken(env)}`,
+    "Content-Type": "application/json",
+  };
+}
+
+export async function postDiscordBot(env, items, fetchImpl = fetch) {
+  const channelId = botChannelId(env);
+  const response = await discordRequest(
+    fetchImpl,
+    `${DISCORD_API}/channels/${encodeURIComponent(channelId)}/messages`,
+    {
+      method: "POST",
+      headers: botHeaders(env),
+      body: JSON.stringify(monitorPayload(items)),
+    },
+    "bot POST",
+  );
+  const message = await response.json();
+  if (!message?.id) throw new Error("Discord bot POST did not return a message ID");
+  return String(message.id);
+}
+
+export async function patchDiscordBot(
+  env,
+  messageId,
+  items,
+  channelId = null,
+  fetchImpl = fetch,
+) {
+  const resolvedChannelId = botChannelId(env, channelId);
+  await discordRequest(
+    fetchImpl,
+    `${DISCORD_API}/channels/${encodeURIComponent(resolvedChannelId)}/messages/${encodeURIComponent(messageId)}`,
+    {
+      method: "PATCH",
+      headers: botHeaders(env),
+      body: JSON.stringify(monitorPayload(items)),
+    },
+    "bot PATCH",
+  );
+}
+
+export async function deleteDiscordBotMessage(
+  env,
+  messageId,
+  channelId = null,
+  fetchImpl = fetch,
+) {
+  const resolvedChannelId = botChannelId(env, channelId);
+  await discordRequest(
+    fetchImpl,
+    `${DISCORD_API}/channels/${encodeURIComponent(resolvedChannelId)}/messages/${encodeURIComponent(messageId)}`,
+    { method: "DELETE", headers: botHeaders(env) },
+    "bot DELETE",
+  );
+}
+
+function smokePayload(description) {
+  return {
+    content: "",
+    embeds: [
+      {
+        color: 0x5383e8,
+        title: "LeagueStats alert smoke test",
+        description,
+      },
+    ],
+    allowed_mentions: EMPTY_MENTIONS,
+  };
+}
+
+export async function smokeDiscordBot(env, fetchImpl = fetch) {
+  const channelId = botChannelId(env);
+  const createResponse = await discordRequest(
+    fetchImpl,
+    `${DISCORD_API}/channels/${encodeURIComponent(channelId)}/messages`,
+    {
+      method: "POST",
+      headers: botHeaders(env),
+      body: JSON.stringify(smokePayload("Creating a temporary bot-authored alert.")),
+    },
+    "smoke POST",
+  );
+  const message = await createResponse.json();
+  if (!message?.id) throw new Error("Discord smoke POST did not return a message ID");
+  const messageId = String(message.id);
+
+  try {
+    await discordRequest(
+      fetchImpl,
+      `${DISCORD_API}/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}`,
+      {
+        method: "PATCH",
+        headers: botHeaders(env),
+        body: JSON.stringify(
+          smokePayload("PASS: the bot created and edited this alert successfully."),
+        ),
+      },
+      "smoke PATCH",
+    );
+  } catch (error) {
+    await deleteDiscordBotMessage(env, messageId, channelId, fetchImpl).catch(() => {});
+    throw error;
+  }
+
+  await deleteDiscordBotMessage(env, messageId, channelId, fetchImpl);
+  return { status: "ok" };
+}
+
+async function postDiscordWebhook(env, items, fetchImpl = fetch) {
+  const response = await fetchImpl(`${webhookBase(env)}?wait=true`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(monitorPayload(items)),
@@ -525,8 +702,8 @@ async function postDiscord(env, items) {
   return String(message.id);
 }
 
-async function patchDiscord(env, messageId, items) {
-  const response = await fetch(
+async function patchDiscordWebhook(env, messageId, items, fetchImpl = fetch) {
+  const response = await fetchImpl(
     `${webhookBase(env)}/messages/${encodeURIComponent(messageId)}`,
     {
       method: "PATCH",
@@ -537,6 +714,25 @@ async function patchDiscord(env, messageId, items) {
   if (!response.ok) {
     throw new Error(`Discord PATCH failed with HTTP ${response.status}`);
   }
+}
+
+async function postDiscord(env, transport, items, fetchImpl = fetch) {
+  return transport === "bot"
+    ? postDiscordBot(env, items, fetchImpl)
+    : postDiscordWebhook(env, items, fetchImpl);
+}
+
+async function patchDiscord(env, target, items, fetchImpl = fetch) {
+  if (target.transport === "bot") {
+    return patchDiscordBot(
+      env,
+      target.messageId,
+      items,
+      target.channelId,
+      fetchImpl,
+    );
+  }
+  return patchDiscordWebhook(env, target.messageId, items, fetchImpl);
 }
 
 function recordsForMessage(state, messageId) {
@@ -601,11 +797,44 @@ async function saveState(db, owner, state, detectionIso) {
   }
 }
 
+export async function commitMonitorChanges(
+  env,
+  { state, owner, detectionIso, transport, newAlerts, patchTargets },
+  { fetchImpl = fetch, saveStateImpl = saveState } = {},
+) {
+  if (newAlerts.length) {
+    const messageId = await postDiscord(env, transport, newAlerts, fetchImpl);
+    for (const alert of newAlerts) {
+      alert.record.discord_message_id = messageId;
+      alert.record.discord_transport = transport;
+      if (transport === "bot") {
+        alert.record.discord_channel_id = botChannelId(env);
+      }
+    }
+    state.discord = isObject(state.discord) ? state.discord : {};
+    state.discord.last_message_id = messageId;
+  }
+
+  for (const target of patchTargets.values()) {
+    await patchDiscord(
+      env,
+      target,
+      recordsForMessage(state, target.messageId),
+      fetchImpl,
+    );
+  }
+
+  state.last_check_at = detectionIso;
+  state.monitor_runtime = "cloudflare-worker-cron";
+  await saveStateImpl(env.MONITOR_DB, owner, state, detectionIso);
+}
+
 export async function monitorStatus(env) {
-  if (!env.MONITOR_DB) return { configured: false };
+  const configuration = monitorConfiguration(env);
+  if (!env.MONITOR_DB) return configuration;
   const state = await readState(env.MONITOR_DB);
   return {
-    configured: Boolean(env.DISCORD_WEBHOOK_URL && env.RIOT_API_KEY),
+    ...configuration,
     stateValid: true,
     lastCheckAt: state.last_check_at ?? null,
     summoners: trackerEntries(state).map(({ tracker }) => tracker.summoner.riot_id),
@@ -613,11 +842,13 @@ export async function monitorStatus(env) {
 }
 
 export async function runLeagueMonitor(env, options = {}) {
+  if (!monitorEnabled(env)) return { status: "disabled" };
   if (!env.MONITOR_DB) throw new Error("MONITOR_DB is not configured");
-  if (!env.DISCORD_WEBHOOK_URL) {
-    throw new Error("DISCORD_WEBHOOK_URL is not configured");
-  }
   if (!env.RIOT_API_KEY) throw new Error("RIOT_API_KEY is not configured");
+  const transport = discordTransport(env);
+  if (!transportConfigured(env, transport)) {
+    throw new Error(`Discord ${transport} transport is not configured`);
+  }
 
   const detectionMs = Number(options.detectionTimestamp ?? Date.now());
   const owner = crypto.randomUUID();
@@ -631,7 +862,7 @@ export async function runLeagueMonitor(env, options = {}) {
     const detectionIso = new Date(detectionMs).toISOString();
     const names = await championNames();
     const newAlerts = [];
-    const patchMessageIds = new Set();
+    const patchTargets = new Map();
 
     for (const { stateKey, tracker } of trackerEntries(state)) {
       await resolveTrackedAccount(env, tracker, detectionMs);
@@ -640,7 +871,13 @@ export async function runLeagueMonitor(env, options = {}) {
         if (game.is_new_alert) {
           newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: game.record });
         }
-        if (game.patch_message_id) patchMessageIds.add(game.patch_message_id);
+        if (game.patch_message_id) {
+          patchTargets.set(String(game.patch_message_id), {
+            messageId: String(game.patch_message_id),
+            transport: game.patch_transport,
+            channelId: game.patch_channel_id,
+          });
+        }
       }
 
       const live = await activeGame(env, tracker, detectionIso, names);
@@ -654,26 +891,19 @@ export async function runLeagueMonitor(env, options = {}) {
       }
     }
 
-    if (newAlerts.length) {
-      const messageId = await postDiscord(env, newAlerts);
-      for (const alert of newAlerts) {
-        alert.record.discord_message_id = messageId;
-      }
-      state.discord = isObject(state.discord) ? state.discord : {};
-      state.discord.last_message_id = messageId;
-    }
-
-    for (const messageId of patchMessageIds) {
-      await patchDiscord(env, messageId, recordsForMessage(state, messageId));
-    }
-
-    state.last_check_at = detectionIso;
-    state.monitor_runtime = "cloudflare-worker-cron";
-    await saveState(env.MONITOR_DB, owner, state, detectionIso);
+    await commitMonitorChanges(env, {
+      state,
+      owner,
+      detectionIso,
+      transport,
+      newAlerts,
+      patchTargets,
+    });
     return {
       status: "ok",
       newAlerts: newAlerts.length,
-      updatedMessages: patchMessageIds.size,
+      updatedMessages: patchTargets.size,
+      transport,
     };
   } catch (error) {
     await releaseLease(env.MONITOR_DB, owner).catch(() => {});

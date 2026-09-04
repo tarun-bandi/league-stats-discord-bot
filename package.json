@@ -6,6 +6,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "register:commands": "node scripts/register-commands.mjs",
+    "smoke:alert": "node scripts/smoke-alert.mjs",
     "test": "node --test"
   },
   "devDependencies": {
