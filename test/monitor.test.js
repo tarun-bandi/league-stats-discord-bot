@@ -176,6 +176,59 @@ test("pending live records stay live while Riot has no completed match", async (
   assert.equal(stateTracker.reported_games["live:12345"].status, "live");
 });
 
+test("stale live records close when Riot has no match data", async () => {
+  const stateTracker = tracker("Example#NA1");
+  stateTracker.reported_games["live:12345"] = {
+    status: "live",
+    champion: "Jax",
+    queue: "KIWI",
+    start_time: "2026-09-04T01:00:00.000Z",
+    live_game_id: "12345",
+    discord_message_id: "message-1",
+  };
+
+  const updates = await reconcilePendingLiveGames(
+    {},
+    stateTracker,
+    "2026-09-04T12:00:00.000Z",
+    async () => null,
+  );
+
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].patch_message_id, "message-1");
+  assert.equal(updates[0].patch_transport, "webhook");
+  assert.equal(stateTracker.reported_games["live:12345"].status, "completed");
+  assert.equal(stateTracker.reported_games["live:12345"].result, "UNAVAILABLE");
+  assert.equal(stateTracker.reported_games["live:12345"].duration, "Unavailable");
+});
+
+test("stale live records close when Riot forbids an unavailable match", async () => {
+  const stateTracker = tracker("Example#NA1");
+  stateTracker.reported_games["live:12345"] = {
+    status: "live",
+    start_time: "2026-09-04T01:00:00.000Z",
+    live_game_id: "12345",
+  };
+  const forbidden = new Error("Forbidden");
+  forbidden.httpStatus = 403;
+
+  const updates = await reconcilePendingLiveGames(
+    {},
+    stateTracker,
+    "2026-09-04T12:00:00.000Z",
+    async () => {
+      throw forbidden;
+    },
+  );
+
+  assert.equal(updates.length, 1);
+  assert.equal(stateTracker.reported_games["live:12345"].status, "completed");
+  assert.equal(
+    stateTracker.reported_games["live:12345"].completion_source,
+    "riot-match-unavailable",
+  );
+});
+
 test("monitorPayload disables mentions and renders completed details", () => {
   const payload = monitorPayload([completedAlert()]);
 

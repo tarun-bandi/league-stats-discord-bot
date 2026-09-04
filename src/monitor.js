@@ -4,6 +4,7 @@ const EASTERN_TIME_ZONE = "America/New_York";
 const EMPTY_MENTIONS = { parse: [] };
 const LEASE_MS = 4 * 60 * 1000;
 const RIOT_CURSOR_LIMIT = 100;
+const STALE_LIVE_MS = 6 * 60 * 60 * 1000;
 
 const NA_REGION = {
   platform: "na1",
@@ -214,9 +215,11 @@ async function riotJson(
     } catch {
       // Riot did not return a JSON error body.
     }
-    throw new Error(
+    const error = new Error(
       `Riot API ${endpoint} failed with HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
     );
+    error.httpStatus = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -382,6 +385,36 @@ function pendingLiveRecords(tracker) {
   );
 }
 
+function isStaleLiveRecord(record, detectionIso) {
+  const startedMs = Date.parse(record.start_time ?? "");
+  const detectedMs = Date.parse(detectionIso);
+  return (
+    Number.isFinite(startedMs) &&
+    Number.isFinite(detectedMs) &&
+    detectedMs - startedMs >= STALE_LIVE_MS
+  );
+}
+
+function unavailableCompletion(record, detectionIso) {
+  Object.assign(record, {
+    status: "completed",
+    result: "UNAVAILABLE",
+    duration: "Unavailable",
+    completed_detected_at: detectionIso,
+    completion_source: "riot-match-unavailable",
+  });
+}
+
+function pendingLivePatch(recordKey, record) {
+  return {
+    recordKey,
+    record,
+    patch_message_id: record.discord_message_id ?? null,
+    patch_transport: record.discord_transport ?? "webhook",
+    patch_channel_id: record.discord_channel_id ?? null,
+  };
+}
+
 export async function reconcilePendingLiveGames(
   env,
   tracker,
@@ -392,23 +425,33 @@ export async function reconcilePendingLiveGames(
   for (const [recordKey, record] of pendingLiveRecords(tracker)) {
     const gameId = normalizedGameId(record.riot_game_id ?? record.live_game_id);
     if (!gameId) continue;
-    const match = await matchDetailImpl(env, `NA1_${gameId}`, {
-      allowNotFound: true,
-    });
-    if (!match) continue;
+    let match;
+    try {
+      match = await matchDetailImpl(env, `NA1_${gameId}`, {
+        allowNotFound: true,
+      });
+    } catch (error) {
+      if (error?.httpStatus !== 403 || !isStaleLiveRecord(record, detectionIso)) {
+        throw error;
+      }
+      unavailableCompletion(record, detectionIso);
+      reconciled.push(pendingLivePatch(recordKey, record));
+      continue;
+    }
+    if (!match) {
+      if (isStaleLiveRecord(record, detectionIso)) {
+        unavailableCompletion(record, detectionIso);
+        reconciled.push(pendingLivePatch(recordKey, record));
+      }
+      continue;
+    }
 
     const game = completedGame(match, tracker, detectionIso);
     Object.assign(record, game, {
       status: "completed",
       live_game_id: record.live_game_id ?? game.riot_game_id,
     });
-    reconciled.push({
-      recordKey,
-      record,
-      patch_message_id: record.discord_message_id ?? null,
-      patch_transport: record.discord_transport ?? "webhook",
-      patch_channel_id: record.discord_channel_id ?? null,
-    });
+    reconciled.push(pendingLivePatch(recordKey, record));
   }
   return reconciled;
 }
