@@ -2,7 +2,7 @@ import { COMMANDS, REGION_CHOICES } from "./commands.js";
 import { monitorStatus, runLeagueMonitor } from "./monitor.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
-const MAX_STATS_MATCHES = 80;
+const MAX_STATS_MATCHES = 30;
 const EASTERN_TIME_ZONE = "America/New_York";
 const EMPTY_MENTIONS = { parse: [] };
 
@@ -228,7 +228,9 @@ async function getMatchIds(env, puuid, region, { count, startTime }) {
 
 async function getMatch(env, matchId, region) {
   const url = `https://${region.regional}.api.riotgames.com/lol/match/v5/matches/${encodeURIComponent(matchId)}`;
-  return riotJson(env, url, 86400);
+  // A Cache API lookup/write counts against the Workers Free subrequest limit.
+  // Fetch match details directly so a 30-game stats request stays below 50.
+  return riotJson(env, url);
 }
 
 async function getMatches(env, matchIds, region) {
@@ -429,7 +431,7 @@ async function buildStatsResponse(interaction, env) {
           },
         ],
         footer: {
-          text: `${region.label} • Times/days use America/New_York${capped ? " • Capped at the 80 newest games" : ""}`,
+          text: `${region.label} • Times/days use America/New_York${capped ? ` • Capped at the ${MAX_STATS_MATCHES} newest games` : ""}`,
         },
       },
     ],
@@ -605,13 +607,24 @@ async function runDeferredCommand(interaction, env) {
     }
     await editOriginalResponse(interaction, payload);
   } catch (error) {
+    console.error(
+      "LeagueStats command failed",
+      interaction.data?.name ?? "unknown-command",
+      error instanceof Error ? error.message : String(error),
+    );
     const content =
       error instanceof UserFacingError
         ? error.message
         : "LeagueStats hit an unexpected error. Try again shortly.";
     try {
       await editOriginalResponse(interaction, message(content));
-    } catch {
+    } catch (responseError) {
+      console.error(
+        "LeagueStats response update failed",
+        responseError instanceof Error
+          ? responseError.message
+          : String(responseError),
+      );
       // Discord may have invalidated the interaction token. Nothing else can be sent safely.
     }
   }
