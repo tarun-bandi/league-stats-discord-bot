@@ -8,6 +8,7 @@ import {
   monitorPayload,
   patchDiscordBot,
   postDiscordBot,
+  reconcilePendingLiveGames,
   runLeagueMonitor,
   smokeDiscordBot,
   validateMonitorState,
@@ -107,6 +108,72 @@ test("findCorrelatedLiveRecord falls back to champion, queue, and start time", (
   });
 
   assert.equal(result[0], "legacy");
+});
+
+test("pending live records reconcile by Riot game ID and retain webhook routing", async () => {
+  const stateTracker = tracker("Example#NA1");
+  stateTracker.summoner.puuid = "puuid-example";
+  stateTracker.reported_games["live:12345"] = {
+    status: "live",
+    champion: "Lux",
+    queue: "Ranked Solo/Duo",
+    start_time: "2026-09-04T12:00:00.000Z",
+    detected_at: "2026-09-04T12:01:00.000Z",
+    live_game_id: "12345",
+    riot_game_id: "12345",
+    discord_message_id: "message-1",
+  };
+
+  const calls = [];
+  const updates = await reconcilePendingLiveGames(
+    {},
+    stateTracker,
+    "2026-09-04T12:40:00.000Z",
+    async (_env, matchId, options) => {
+      calls.push({ matchId, options });
+      return {
+        metadata: { matchId: "NA1_12345" },
+        info: {
+          gameId: 12345,
+          gameStartTimestamp: Date.parse("2026-09-04T12:00:00.000Z"),
+          gameDuration: 1805,
+          queueId: 420,
+          gameMode: "CLASSIC",
+          participants: [
+            { puuid: "puuid-example", championName: "Lux", win: true },
+          ],
+        },
+      };
+    },
+  );
+
+  assert.deepEqual(calls, [
+    { matchId: "NA1_12345", options: { allowNotFound: true } },
+  ]);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].patch_message_id, "message-1");
+  assert.equal(updates[0].patch_transport, "webhook");
+  assert.equal(stateTracker.reported_games["live:12345"].status, "completed");
+  assert.equal(stateTracker.reported_games["live:12345"].result, "WIN");
+  assert.equal(stateTracker.reported_games["live:12345"].duration, "30m 05s");
+});
+
+test("pending live records stay live while Riot has no completed match", async () => {
+  const stateTracker = tracker("Example#NA1");
+  stateTracker.reported_games["live:12345"] = {
+    status: "live",
+    live_game_id: "12345",
+  };
+
+  const updates = await reconcilePendingLiveGames(
+    {},
+    stateTracker,
+    "2026-09-04T12:40:00.000Z",
+    async () => null,
+  );
+
+  assert.deepEqual(updates, []);
+  assert.equal(stateTracker.reported_games["live:12345"].status, "live");
 });
 
 test("monitorPayload disables mentions and renders completed details", () => {

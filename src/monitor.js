@@ -304,9 +304,9 @@ async function matchIds(env, puuid, startTime) {
   return riotJson(env, url);
 }
 
-async function matchDetail(env, matchId) {
+async function matchDetail(env, matchId, { allowNotFound = false } = {}) {
   const url = `https://${NA_REGION.regional}.api.riotgames.com/lol/match/v5/matches/${encodeURIComponent(matchId)}`;
-  return riotJson(env, url);
+  return riotJson(env, url, { allowNotFound });
 }
 
 async function matchDetails(env, ids, cache = new Map()) {
@@ -374,6 +374,43 @@ function findReportedByMatchId(tracker, matchId, riotGameId) {
       .filter(Boolean)
       .includes(normalized);
   });
+}
+
+function pendingLiveRecords(tracker) {
+  return Object.entries(tracker.reported_games).filter(
+    ([, record]) => record.status === "live",
+  );
+}
+
+export async function reconcilePendingLiveGames(
+  env,
+  tracker,
+  detectionIso,
+  matchDetailImpl = matchDetail,
+) {
+  const reconciled = [];
+  for (const [recordKey, record] of pendingLiveRecords(tracker)) {
+    const gameId = normalizedGameId(record.riot_game_id ?? record.live_game_id);
+    if (!gameId) continue;
+    const match = await matchDetailImpl(env, `NA1_${gameId}`, {
+      allowNotFound: true,
+    });
+    if (!match) continue;
+
+    const game = completedGame(match, tracker, detectionIso);
+    Object.assign(record, game, {
+      status: "completed",
+      live_game_id: record.live_game_id ?? game.riot_game_id,
+    });
+    reconciled.push({
+      recordKey,
+      record,
+      patch_message_id: record.discord_message_id ?? null,
+      patch_transport: record.discord_transport ?? "webhook",
+      patch_channel_id: record.discord_channel_id ?? null,
+    });
+  }
+  return reconciled;
 }
 
 export function findCorrelatedLiveRecord(tracker, game) {
@@ -837,6 +874,10 @@ export async function monitorStatus(env) {
     ...configuration,
     stateValid: true,
     lastCheckAt: state.last_check_at ?? null,
+    pendingLiveAlerts: trackerEntries(state).reduce(
+      (total, { tracker }) => total + pendingLiveRecords(tracker).length,
+      0,
+    ),
     summoners: trackerEntries(state).map(({ tracker }) => tracker.summoner.riot_id),
   };
 }
@@ -866,6 +907,20 @@ export async function runLeagueMonitor(env, options = {}) {
 
     for (const { stateKey, tracker } of trackerEntries(state)) {
       await resolveTrackedAccount(env, tracker, detectionMs);
+      const reconciled = await reconcilePendingLiveGames(
+        env,
+        tracker,
+        detectionIso,
+      );
+      for (const game of reconciled) {
+        if (game.patch_message_id) {
+          patchTargets.set(String(game.patch_message_id), {
+            messageId: String(game.patch_message_id),
+            transport: game.patch_transport,
+            channelId: game.patch_channel_id,
+          });
+        }
+      }
       const completed = await completedUpdates(env, tracker, detectionIso);
       for (const game of completed) {
         if (game.is_new_alert) {
