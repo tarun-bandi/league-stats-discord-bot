@@ -110,7 +110,7 @@ test("findCorrelatedLiveRecord falls back to champion, queue, and start time", (
   assert.equal(result[0], "legacy");
 });
 
-test("pending live records reconcile by Riot game ID and retain webhook routing", async () => {
+test("pending live records reconcile by Riot game ID", async () => {
   const stateTracker = tracker("Example#NA1");
   stateTracker.summoner.puuid = "puuid-example";
   stateTracker.reported_games["live:12345"] = {
@@ -152,7 +152,6 @@ test("pending live records reconcile by Riot game ID and retain webhook routing"
   ]);
   assert.equal(updates.length, 1);
   assert.equal(updates[0].patch_message_id, "message-1");
-  assert.equal(updates[0].patch_transport, "webhook");
   assert.equal(stateTracker.reported_games["live:12345"].status, "completed");
   assert.equal(stateTracker.reported_games["live:12345"].result, "WIN");
   assert.equal(stateTracker.reported_games["live:12345"].duration, "30m 05s");
@@ -196,7 +195,6 @@ test("stale live records close when Riot has no match data", async () => {
 
   assert.equal(updates.length, 1);
   assert.equal(updates[0].patch_message_id, "message-1");
-  assert.equal(updates[0].patch_transport, "webhook");
   assert.equal(stateTracker.reported_games["live:12345"].status, "completed");
   assert.equal(stateTracker.reported_games["live:12345"].result, "UNAVAILABLE");
   assert.equal(stateTracker.reported_games["live:12345"].duration, "Unavailable");
@@ -279,6 +277,91 @@ test("patchDiscordBot edits the stored message in its original channel", async (
   assert.equal(calls[0][1].headers.Authorization, "Bot test-token");
 });
 
+test("commitMonitorChanges persists the returned bot message ID", async () => {
+  const state = validState();
+  const alert = completedAlert();
+  state.reported_games.game = alert.record;
+  let savedState;
+
+  await commitMonitorChanges(
+    { ...botEnv, MONITOR_DB: {} },
+    {
+      state,
+      owner: "test-owner",
+      detectionIso: "2026-08-23T12:30:00.000Z",
+      newAlerts: [alert],
+      patchTargets: new Map(),
+    },
+    {
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ id: "message-123" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      saveStateImpl: async (_db, _owner, saved) => {
+        savedState = structuredClone(saved);
+      },
+    },
+  );
+
+  assert.equal(savedState.reported_games.game.discord_message_id, "message-123");
+  assert.equal(savedState.reported_games.game.discord_transport, "bot");
+  assert.equal(
+    savedState.reported_games.game.discord_channel_id,
+    botEnv.DISCORD_ALERT_CHANNEL_ID,
+  );
+});
+
+test("commitMonitorChanges rebuilds every record in a grouped bot message", async () => {
+  const state = validState();
+  const first = completedAlert().record;
+  const second = {
+    ...completedAlert().record,
+    champion: "Lux",
+    result: "LOSS",
+    start_time: "2026-08-23T12:05:00.000Z",
+  };
+  first.discord_message_id = "message-123";
+  second.discord_message_id = "message-123";
+  state.reported_games.first = first;
+  state.additional_summoners["na:tixbs chaos#na1"].reported_games.second = second;
+  const calls = [];
+
+  await commitMonitorChanges(
+    { ...botEnv, MONITOR_DB: {} },
+    {
+      state,
+      owner: "test-owner",
+      detectionIso: "2026-08-23T12:30:00.000Z",
+      newAlerts: [],
+      patchTargets: new Map([
+        [
+          "message-123",
+          {
+            messageId: "message-123",
+            channelId: botEnv.DISCORD_ALERT_CHANNEL_ID,
+          },
+        ],
+      ]),
+    },
+    {
+      fetchImpl: async (...args) => {
+        calls.push(args);
+        return new Response(null, { status: 204 });
+      },
+      saveStateImpl: async () => {},
+    },
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1].method, "PATCH");
+  const description = JSON.parse(calls[0][1].body).embeds[0].description;
+  assert.match(description, /HelloThere#9494/);
+  assert.match(description, /TIXBS Chaos#NA1/);
+  assert.match(description, /Kassadin/);
+  assert.match(description, /Lux/);
+});
+
 test("smokeDiscordBot creates, edits, and deletes one temporary message", async () => {
   const calls = [];
   await smokeDiscordBot(botEnv, async (...args) => {
@@ -322,7 +405,6 @@ test("monitorConfiguration reports bot readiness without exposing values", () =>
     MONITOR_DB: {},
     MONITOR_ENABLED: "true",
     RIOT_API_KEY: "riot-test-key",
-    DISCORD_ALERT_TRANSPORT: "bot",
   });
 
   assert.deepEqual(configuration, {
@@ -345,7 +427,6 @@ test("Discord delivery failure does not save monitor state", async () => {
         state,
         owner: "test-owner",
         detectionIso: "2026-08-23T12:30:00.000Z",
-        transport: "bot",
         newAlerts: [alert],
         patchTargets: new Map(),
       },

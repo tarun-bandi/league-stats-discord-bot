@@ -18,8 +18,6 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 - `RIOT_API_KEY` — Worker secret used for Riot API requests
 - `DISCORD_BOT_TOKEN` — Worker secret used to create and edit monitor alerts
 - `DISCORD_ALERT_CHANNEL_ID` — destination channel for monitor alerts
-- `DISCORD_ALERT_TRANSPORT` — temporary cutover selector (`webhook` or `bot`)
-- `DISCORD_WEBHOOK_URL` — temporary bridge secret for legacy alerts during cutover
 - `MONITOR_ENABLED` — explicit monitor kill switch; only `true`, `1`, `yes`, or `on` enables checks
 - `MONITOR_DB` — D1 binding containing the authoritative monitor state
 
@@ -40,7 +38,7 @@ Put local-only secrets in `.dev.vars`; that file is ignored by Git.
 ## Deployment
 
 Apply `migrations/0001_monitor_state.sql`, seed the `league-game-monitor` row
-from a validated state backup, configure the three secrets, and deploy with
+from a validated state backup, configure the five secrets, and deploy with
 Wrangler. Do not enable the Cron Trigger until the state row is present.
 
 Global Discord commands can be bulk-registered with:
