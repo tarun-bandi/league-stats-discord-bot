@@ -11,6 +11,7 @@ import {
 import { MODE_CHOICES, queueName, modeNote, matchMetrics, metricsSummary } from "./league.js";
 import { brandedEmbed } from "./branding.js";
 import { getChampionCatalog, championInfo, championThumbnail } from "./champions.js";
+import { riotKeyFingerprint } from "./riot-key.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const MAX_STATS_MATCHES = 30;
@@ -197,9 +198,11 @@ function getMode(interaction) {
   return value;
 }
 
-async function cachedJson(url, init, ttlSeconds) {
+async function cachedJson(url, init, ttlSeconds, cacheScope = "") {
   const cache = globalThis.caches?.default;
-  const cacheKey = new Request(url, { method: "GET" });
+  const cacheUrl = new URL(url);
+  if (cacheScope) cacheUrl.searchParams.set("__leaguestats_credential", cacheScope);
+  const cacheKey = new Request(cacheUrl, { method: "GET" });
   if (cache && ttlSeconds > 0) {
     const cached = await cache.match(cacheKey);
     if (cached) return cached.json();
@@ -235,6 +238,7 @@ async function riotJson(env, url, ttlSeconds = 0) {
       url,
       { headers: { "X-Riot-Token": env.RIOT_API_KEY } },
       ttlSeconds,
+      ttlSeconds > 0 ? await riotKeyFingerprint(env.RIOT_API_KEY) : "",
     );
   } catch (error) {
     if (error instanceof UserFacingError) throw error;

@@ -112,6 +112,13 @@ Riot development keys expire; use an approved personal/production key for
 long-running service where appropriate. This repository cannot make a temporary
 Riot key permanent.
 
+When rotating `RIOT_API_KEY`, command caches are isolated by a one-way credential
+fingerprint. The next monitor check refreshes all tracked account identifiers;
+if Riot requires a new encrypted PUUID, the bot verifies that account against a
+previously saved Riot match before changing it. Existing cursors, rank baselines
+and Discord message records are retained. If identity cannot be verified, the
+check fails without saving state; do not reset history to work around it.
+
 The current monitor intentionally validates **three NA trackers**. Their live
 configuration and cursors are in D1, not a YAML file. Autocomplete reads that same
 state. To change the roster, pause monitoring, back up D1, update only the target

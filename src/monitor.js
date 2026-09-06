@@ -3,6 +3,7 @@ import { brandedEmbed } from "./branding.js";
 import { observeRanks, rankLabel, RANK_POLL_MS } from "./ranks.js";
 import { syncDiscordApplication } from "./application.js";
 import { getChampionCatalog, championInfo } from "./champions.js";
+import { riotKeyFingerprint } from "./riot-key.js";
 
 const STATE_KEY = "league-game-monitor";
 const DISCORD_API = "https://discord.com/api/v10";
@@ -189,11 +190,11 @@ async function riotJson(
 }
 
 
-async function resolveTrackedAccount(env, tracker, detectionMs) {
+export async function resolveTrackedAccount(env, tracker, detectionMs, { force = false } = {}) {
   const summoner = tracker.summoner;
   const checkedAt = Date.parse(summoner.riot_account_checked_at ?? "");
   if (
-    summoner.puuid &&
+    !force && summoner.puuid &&
     Number.isFinite(checkedAt) &&
     detectionMs - checkedAt < 24 * 60 * 60 * 1000
   ) {
@@ -209,8 +210,21 @@ async function resolveTrackedAccount(env, tracker, detectionMs) {
     const riotId = parseRiotId(summoner.riot_id);
     const url = `https://${NA_REGION.regional}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(riotId.gameName)}/${encodeURIComponent(riotId.tagLine)}`;
     account = await riotJson(env, url);
+    if (summoner.puuid && account.puuid !== summoner.puuid) {
+      // A renamed/reused Riot ID must not silently switch the tracked player.
+      // Prove continuity against a previously saved Riot match before rebinding.
+      const anchor = [tracker.newest_completed_match?.id,
+        ...Object.values(tracker.reported_games).map((record) => record.match_id)]
+        .find((id) => /^NA1_\d+$/.test(id ?? ""));
+      if (!anchor) throw new Error("Cannot verify tracked account after Riot key change: no saved Riot match");
+      const match = await matchDetail(env, anchor);
+      if (!participantFor(match, account.puuid)) {
+        throw new Error("Riot ID resolves to a different account; tracked identity was not changed");
+      }
+    }
   }
 
+  if (!account?.puuid || !account.gameName || !account.tagLine) throw new Error("Riot account data is incomplete");
   summoner.puuid = account.puuid;
   summoner.riot_id = `${account.gameName}#${account.tagLine}`;
   summoner.riot_account_checked_at = new Date(detectionMs).toISOString();
@@ -825,13 +839,16 @@ export async function runLeagueMonitor(env, options = {}) {
   try {
     const previous = await readState(env.MONITOR_DB);
     const state = structuredClone(previous);
+    const keyFingerprint = await riotKeyFingerprint(env.RIOT_API_KEY);
+    const keyChanged = state.riot_key_fingerprint !== keyFingerprint;
+    state.riot_key_fingerprint = keyFingerprint;
     const detectionIso = new Date(detectionMs).toISOString();
     const names = await getChampionCatalog();
     const newAlerts = [];
     const patchTargets = new Map();
 
     for (const { stateKey, tracker } of trackerEntries(state)) {
-      await resolveTrackedAccount(env, tracker, detectionMs);
+      await resolveTrackedAccount(env, tracker, detectionMs, { force: keyChanged });
       const reconciled = await reconcilePendingLiveGames(
         env,
         tracker,

@@ -180,6 +180,10 @@ test("full monitor Discord failure preserves stored rank baseline and game histo
   t.mock.method(globalThis, "fetch", async (input) => {
     const url = String(input instanceof Request ? input.url : input);
     if (url.includes("discord.com")) return new Response(null, { status: 500 });
+    if (url.includes("/accounts/by-puuid/")) {
+      const name = url.split("/").at(-1);
+      return Response.json({ puuid: name, gameName: name, tagLine: "NA1" });
+    }
     if (url.includes("/realms/")) return Response.json({ v: "test" });
     if (url.includes("champion.json")) return Response.json({ data: {} });
     if (url.includes("/ids?")) return Response.json(["NA1_old"]);
