@@ -1,4 +1,8 @@
-import { COMMANDS, REGION_CHOICES } from "./commands.js";
+import {
+  COMMANDS,
+  MONITORED_SUMMONER_DEFAULTS,
+  REGION_CHOICES,
+} from "./commands.js";
 import {
   monitorConfiguration,
   monitorStatus,
@@ -74,6 +78,57 @@ function deferredMessage() {
   return json({
     type: 5,
     data: { allowed_mentions: EMPTY_MENTIONS },
+  });
+}
+
+export function summonerAutocompleteChoices(
+  input,
+  summoners = MONITORED_SUMMONER_DEFAULTS,
+) {
+  const query = String(input ?? "").trim().toLowerCase();
+  const seen = new Set();
+
+  return summoners
+    .map((riotId) => String(riotId ?? "").trim())
+    .filter((riotId) => {
+      const normalized = riotId.toLowerCase();
+      if (!riotId || seen.has(normalized) || !normalized.includes(query)) {
+        return false;
+      }
+      seen.add(normalized);
+      return true;
+    })
+    .slice(0, 25)
+    .map((riotId) => ({ name: riotId, value: riotId }));
+}
+
+export async function autocompleteResponse(interaction, env) {
+  const focused = interaction.data?.options?.find((option) => option.focused);
+  if (
+    focused?.name !== "summoner" ||
+    !["stats", "recent", "live"].includes(interaction.data?.name)
+  ) {
+    return json({ type: 8, data: { choices: [] } });
+  }
+
+  let summoners = MONITORED_SUMMONER_DEFAULTS;
+  try {
+    const status = await monitorStatus(env);
+    if (Array.isArray(status.summoners) && status.summoners.length) {
+      summoners = status.summoners;
+    }
+  } catch (error) {
+    console.error(
+      "LeagueStats autocomplete could not read monitor state",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+
+  return json({
+    type: 8,
+    data: {
+      choices: summonerAutocompleteChoices(focused.value, summoners),
+    },
   });
 }
 
@@ -701,6 +756,10 @@ export default {
 
     if (interaction.type === 1) {
       return json({ type: 1 });
+    }
+
+    if (interaction.type === 4) {
+      return autocompleteResponse(interaction, env);
     }
 
     if (interaction.type !== 2) {

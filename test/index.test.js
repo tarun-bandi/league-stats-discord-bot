@@ -1,7 +1,100 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { aggregateMatches, parseRiotId, UserFacingError } from "../src/index.js";
+import { COMMANDS, MONITORED_SUMMONER_DEFAULTS } from "../src/commands.js";
+import {
+  aggregateMatches,
+  autocompleteResponse,
+  parseRiotId,
+  summonerAutocompleteChoices,
+  UserFacingError,
+} from "../src/index.js";
+
+test("summoner options autocomplete the monitored accounts", () => {
+  for (const command of COMMANDS.filter(({ name }) =>
+    ["stats", "recent", "live"].includes(name),
+  )) {
+    const option = command.options.find(({ name }) => name === "summoner");
+    assert.equal(option.required, true);
+    assert.equal(option.autocomplete, true);
+    assert.equal(option.choices, undefined);
+  }
+});
+
+test("summoner autocomplete lists and filters monitored accounts", () => {
+  assert.deepEqual(
+    summonerAutocompleteChoices(""),
+    MONITORED_SUMMONER_DEFAULTS.map((riotId) => ({
+      name: riotId,
+      value: riotId,
+    })),
+  );
+  assert.deepEqual(summonerAutocompleteChoices("chaos"), [
+    { name: "TIXBS Chaos#NA1", value: "TIXBS Chaos#NA1" },
+  ]);
+});
+
+test("summoner autocomplete follows monitor-state Riot ID renames", () => {
+  assert.deepEqual(
+    summonerAutocompleteChoices("renamed", [
+      "HelloThere#9494",
+      "Renamed Account#NA1",
+    ]),
+    [{ name: "Renamed Account#NA1", value: "Renamed Account#NA1" }],
+  );
+});
+
+test("autocomplete response reads current Riot IDs from monitor state", async () => {
+  const tracker = (riotId) => ({
+    summoner: { riot_id: riotId },
+    baseline: {},
+    newest_completed_match: null,
+    reported_games: {},
+  });
+  const state = {
+    ...tracker("HelloThere#9494"),
+    additional_summoners: {
+      "na:tixbs chaos#na1": tracker("TIXBS Chaos#NA1"),
+      "na:renamed#na1": tracker("Renamed Account#NA1"),
+    },
+  };
+  const env = {
+    MONITOR_DB: {
+      prepare() {
+        return {
+          bind() {
+            return {
+              async first() {
+                return { state_json: JSON.stringify(state) };
+              },
+            };
+          },
+        };
+      },
+    },
+  };
+
+  const response = await autocompleteResponse(
+    {
+      data: {
+        name: "stats",
+        options: [
+          { name: "summoner", value: "renamed", focused: true },
+        ],
+      },
+    },
+    env,
+  );
+
+  assert.deepEqual(await response.json(), {
+    type: 8,
+    data: {
+      choices: [
+        { name: "Renamed Account#NA1", value: "Renamed Account#NA1" },
+      ],
+    },
+  });
+});
 
 test("parseRiotId preserves spaces and splits on the final hash", () => {
   assert.deepEqual(parseRiotId(" Knaye East#YEEZY "), {

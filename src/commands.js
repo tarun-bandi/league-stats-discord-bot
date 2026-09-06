@@ -16,11 +16,18 @@ export const REGION_CHOICES = [
   ["Vietnam", "vn"],
 ];
 
+export const MONITORED_SUMMONER_DEFAULTS = [
+  "HelloThere#9494",
+  "TIXBS Chaos#NA1",
+  "Knaye East#YEEZY",
+];
+
 const riotIdOption = {
   name: "summoner",
-  description: "Riot ID in Game Name#TAG format",
+  description: "Riot ID; monitored accounts are suggested as you type",
   type: 3,
   required: true,
+  autocomplete: true,
 };
 
 const regionOption = {

@@ -6,6 +6,7 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 
 - `/help`, `/stats`, `/recent`, `/live`, and `/ping`
 - Arbitrary Riot IDs and supported League regions for interactive commands
+- Monitored-account autocomplete for the `summoner` option on `/stats`, `/recent`, and `/live`
 - One-minute Cloudflare Cron Trigger for three configured NA accounts
 - Riot Match-v5 and Spectator-v5 monitoring
 - D1-backed durable cursors, live-game correlation, and Discord message IDs
@@ -49,6 +50,10 @@ DISCORD_APPLICATION_ID=... DISCORD_BOT_TOKEN_FILE=/secure/path/token \
 ```
 
 The registration script reads the bot token from the file and never prints it.
+Autocomplete suggestions are read from the authoritative D1 monitor state, so a
+Riot ID rename tracked by the monitor is reflected without another command
+registration. The three current IDs are used as a fallback if state is
+temporarily unavailable; users may still enter any valid Riot ID.
 
 Before enabling bot-authored monitor alerts, verify channel permissions with a
 temporary create/edit/delete smoke message:
