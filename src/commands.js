@@ -75,7 +75,7 @@ export const COMMANDS = [
       modeOption,
       {
         name: "champion",
-        description: "Champion-specific stats within the newest 30 games; type a name",
+        description: "Champion-specific stats; starts with 30 games, with Load more on the card",
         type: 3,
         required: false,
         autocomplete: true,

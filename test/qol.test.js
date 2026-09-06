@@ -99,6 +99,20 @@ test("recent pages move both directions and only fetch uncached pages", async (t
   assert.equal(last.components[0].components[1].disabled, true);
 });
 
+test("history stops at 300 with a clear cap and makes no further match requests", async (t) => {
+  const db = testDb(); const env = envFixture(db); let requests = 0;
+  mockLookup(t, Array.from({ length: 320 }, (_, i) => game(1000 - i)), { onRequest: (url) => { if (url.pathname.includes("/lol/match/")) requests++; } });
+  const view = await savedView(db, await createLookup(interaction("stats", { summoner: "Test#NA1" }), env));
+  let payload;
+  for (let i = 0; i < 9; i++) payload = await updateLookup(click(view, "more"), env);
+  assert.equal((await readRecord(db, `view:${view.id}`)).snapshot.matches.length, 300);
+  assert.match(payload.content, /History limit reached: 300/);
+  assert.equal(payload.components[0].components.find((button) => button.label === "Load 30 more").disabled, true);
+  const before = requests;
+  await updateLookup(click(view, "more"), env);
+  assert.equal(requests, before);
+});
+
 test("card controls change period/champion and deny other users, servers and expired cards", async (t) => {
   const db = testDb(); const env = envFixture(db); mockLookup(t, [game(1)]);
   const initial = await createLookup(interaction("stats", { summoner: "Test#NA1" }), env);

@@ -93,6 +93,20 @@ test("completed-only suppresses new live posts while still advancing live cursor
   for (const { tracker } of trackerEntries(await readState(db))) { assert.equal(tracker.newest_live_game_id, "300"); assert.deepEqual(tracker.reported_games, {}); }
 });
 
+test("a newly enrolled account without old matches reports its first completed game once", async (t) => {
+  const state = stateFixture(); state.roster_version = 2;
+  state.newest_completed_match = null; state.riot_newest_completed_match_id = null;
+  state.monitor_started_at = new Date(Date.now() - 2 * 3600_000).toISOString();
+  state.additional_summoners.b.monitor_paused = true;
+  state.additional_summoners.c.monitor_paused = true;
+  const db = testDb(state); const env = envFixture(db); const posts = [];
+  mockMonitor(t, { onRequest: (url, init) => { if (url.pathname.endsWith("/messages")) posts.push(JSON.parse(init.body)); } });
+  assert.equal((await runLeagueMonitor(env)).newAlerts, 1);
+  assert.equal((await readState(db)).riot_newest_completed_match_id, "NA1_100");
+  assert.equal((await runLeagueMonitor(env)).newAlerts, 0);
+  assert.equal(posts.length, 1);
+});
+
 test("archived live alerts drain by editing the original grouped message", async (t) => {
   const state = stateFixture(); state.roster_version = 2; state.monitor_paused = true; state.removed_at = new Date().toISOString();
   state.reported_games.live = { status: "live", live_game_id: "200", riot_game_id: "200", start_time: new Date().toISOString(), discord_message_id: "77", discord_channel_id: "789" };
@@ -139,4 +153,12 @@ test("failed credential notifications remain queued, and confirmed auth failure 
   const health = await readRecord(db, "health:riot");
   assert.equal(health.status, "invalid"); assert.equal(health.pending.length, 1); assert.equal(health.deliveryError, true);
   await reportCredentialHealth(env, "invalid", state); assert.equal((await readRecord(db, "health:riot")).pending.length, 1);
+});
+
+test("concurrent credential reporters share a lease and emit only one failure notice", async (t) => {
+  const db = testDb(stateFixture()); const env = envFixture(db); const posts = [];
+  mockMonitor(t, { onRequest: (url, init) => { if (url.pathname.endsWith("/messages")) posts.push(JSON.parse(init.body)); } });
+  await Promise.all([reportCredentialHealth(env, "invalid", stateFixture()), reportCredentialHealth(env, "invalid", stateFixture())]);
+  assert.equal(posts.length, 1);
+  assert.equal((await readRecord(db, "health:riot")).pending.length, 0);
 });
