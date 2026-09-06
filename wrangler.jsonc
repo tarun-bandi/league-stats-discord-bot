@@ -3,6 +3,9 @@
   "name": "discord-interactions-bot",
   "main": "src/index.js",
   "compatibility_date": "2026-08-23",
+  "vars": {
+    "DISCORD_APPLICATION_ID": "777218985527083008"
+  },
   "observability": {
     "enabled": true
   },

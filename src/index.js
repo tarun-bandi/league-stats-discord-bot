@@ -8,6 +8,9 @@ import {
   monitorStatus,
   runLeagueMonitor,
 } from "./monitor.js";
+import { MODE_CHOICES, queueName, modeNote, matchMetrics, metricsSummary } from "./league.js";
+import { brandedEmbed } from "./branding.js";
+import { getChampionCatalog, championInfo, championThumbnail } from "./champions.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const MAX_STATS_MATCHES = 30;
@@ -33,25 +36,6 @@ const REGIONS = {
   vn: { platform: "vn2", regional: "sea", label: "VN" },
 };
 
-const QUEUES = {
-  0: "Custom",
-  400: "Normal Draft",
-  420: "Ranked Solo/Duo",
-  430: "Normal Blind",
-  440: "Ranked Flex",
-  450: "ARAM",
-  490: "Quickplay",
-  700: "Clash",
-  830: "Co-op vs. AI",
-  840: "Co-op vs. AI",
-  850: "Co-op vs. AI",
-  900: "URF",
-  1020: "One for All",
-  1300: "Nexus Blitz",
-  1400: "Ultimate Spellbook",
-  1700: "Arena",
-};
-
 export class UserFacingError extends Error {}
 
 function json(data, status = 200) {
@@ -64,7 +48,7 @@ function json(data, status = 200) {
 function message(content, { ephemeral = false, embeds = [] } = {}) {
   return {
     content,
-    embeds,
+    embeds: embeds.map(brandedEmbed),
     allowed_mentions: EMPTY_MENTIONS,
     ...(ephemeral ? { flags: 64 } : {}),
   };
@@ -205,6 +189,14 @@ function getRegion(interaction) {
   return region;
 }
 
+function getMode(interaction) {
+  const value = Number(optionValue(interaction, "mode", 0));
+  if (!MODE_CHOICES.some((mode) => mode.value === value)) {
+    throw new UserFacingError("Choose a supported game mode from the mode option.");
+  }
+  return value;
+}
+
 async function cachedJson(url, init, ttlSeconds) {
   const cache = globalThis.caches?.default;
   const cacheKey = new Request(url, { method: "GET" });
@@ -278,9 +270,10 @@ async function getRankedEntries(env, puuid, region) {
   }
 }
 
-async function getMatchIds(env, puuid, region, { count, startTime }) {
+export async function getMatchIds(env, puuid, region, { count, startTime, queue }) {
   const query = new URLSearchParams({ start: "0", count: String(count) });
   if (startTime) query.set("startTime", String(startTime));
+  if (queue) query.set("queue", String(queue));
   const url = `https://${region.regional}.api.riotgames.com/lol/match/v5/matches/by-puuid/${encodeURIComponent(puuid)}/ids?${query}`;
   return riotJson(env, url, 45);
 }
@@ -306,10 +299,6 @@ async function getMatches(env, matchIds, region) {
 
 function participantFor(match, puuid) {
   return match.info?.participants?.find((participant) => participant.puuid === puuid);
-}
-
-function queueName(queueId, fallback = "League game") {
-  return QUEUES[queueId] ?? fallback;
 }
 
 function formatPercent(value) {
@@ -352,6 +341,7 @@ export function aggregateMatches(matches, puuid, days) {
         matchId: match.metadata?.matchId ?? "unknown",
         timestamp: Number(match.info?.gameStartTimestamp) || 0,
         champion: participant.championName || "Unknown",
+        championId: participant.championId,
         win: Boolean(participant.win),
         kills: Number(participant.kills) || 0,
         deaths: Number(participant.deaths) || 0,
@@ -361,6 +351,7 @@ export function aggregateMatches(matches, puuid, days) {
           (Number(participant.neutralMinionsKilled) || 0),
         duration,
         queue: queueName(match.info?.queueId, match.info?.gameMode),
+        metrics: matchMetrics(participant, duration),
       };
     })
     .filter(Boolean)
@@ -374,6 +365,10 @@ export function aggregateMatches(matches, puuid, days) {
   const totalCs = rows.reduce((sum, row) => sum + row.cs, 0);
   const totalSeconds = rows.reduce((sum, row) => sum + row.duration, 0);
   const activeDays = new Set(rows.map((row) => easternDay(row.timestamp))).size;
+  const metricAverage = (key) => {
+    const available = rows.map((row) => row.metrics[key]).filter((value) => value != null);
+    return available.length ? available.reduce((sum, value) => sum + value, 0) / available.length : null;
+  };
   const champions = new Map();
 
   for (const row of rows) {
@@ -411,6 +406,10 @@ export function aggregateMatches(matches, puuid, days) {
     averageAssists: games ? assists / games : 0,
     csPerMinute: totalSeconds ? totalCs / (totalSeconds / 60) : 0,
     averageDuration: games ? totalSeconds / games : 0,
+    averageDamagePerMinute: metricAverage("damage_per_minute"),
+    averageVision: metricAverage("vision"),
+    averageGold: metricAverage("gold"),
+    pentaKills: rows.reduce((sum, row) => sum + (row.metrics.penta_kills ?? 0), 0),
     topChampions,
     streak: streak ? `${streak}${streakWin ? "W" : "L"}` : "—",
   };
@@ -439,10 +438,11 @@ function topChampionSummary(champions) {
     .join(" • ");
 }
 
-async function buildStatsResponse(interaction, env) {
+export async function buildStatsResponse(interaction, env) {
   const riotId = parseRiotId(optionValue(interaction, "summoner", ""));
   const days = Math.max(1, Math.min(30, Number(optionValue(interaction, "days", 7))));
   const region = getRegion(interaction);
+  const mode = getMode(interaction);
   const account = await resolveAccount(env, riotId, region);
   const startTime = Math.floor((Date.now() - days * 86400_000) / 1000);
 
@@ -450,6 +450,7 @@ async function buildStatsResponse(interaction, env) {
     getMatchIds(env, account.puuid, region, {
       count: MAX_STATS_MATCHES,
       startTime,
+      queue: mode,
     }),
     getRankedEntries(env, account.puuid, region),
   ]);
@@ -457,15 +458,17 @@ async function buildStatsResponse(interaction, env) {
   const stats = aggregateMatches(matches, account.puuid, days);
   const canonicalId = `${account.gameName ?? riotId.gameName}#${account.tagLine ?? riotId.tagLine}`;
   const capped = matchIds.length === MAX_STATS_MATCHES;
+  const catalog = await getChampionCatalog();
 
   return message("", {
     embeds: [
       {
         color: 0x5383e8,
         title: `${canonicalId} — last ${days} day${days === 1 ? "" : "s"}`,
+        ...championThumbnail(catalog, stats.topChampions[0]?.name),
         description: stats.games
           ? `**${stats.wins}W–${stats.losses}L • ${formatPercent(stats.winRate)} win rate**`
-          : "No League games found in this period.",
+          : `No League games returned by Riot in this period.${modeNote(mode) ? `\n${modeNote(mode)}` : ""}`,
         fields: [
           { name: "Rank", value: rankedSummary(rankedEntries), inline: false },
           {
@@ -484,71 +487,59 @@ async function buildStatsResponse(interaction, env) {
             inline: false,
           },
           {
+            name: "Impact",
+            value: [
+              stats.averageDamagePerMinute == null ? null : `${Math.round(stats.averageDamagePerMinute)} champion damage/min`,
+              stats.averageVision == null ? null : `${stats.averageVision.toFixed(1)} avg vision`,
+              stats.averageGold == null ? null : `${(stats.averageGold / 1000).toFixed(1)}k avg gold`,
+              stats.pentaKills ? `${stats.pentaKills} pentakills` : null,
+            ].filter(Boolean).join(" • ") || "Not supplied by Riot for these games",
+            inline: false,
+          },
+          {
             name: "Top champions",
             value: topChampionSummary(stats.topChampions),
             inline: false,
           },
         ],
         footer: {
-          text: `${region.label} • Times/days use America/New_York${capped ? ` • Capped at the ${MAX_STATS_MATCHES} newest games` : ""}`,
+          text: `${region.label} • ${mode ? queueName(mode) : "All modes"} • America/New_York${capped ? ` • Capped at the ${MAX_STATS_MATCHES} newest games` : ""}`,
         },
       },
     ],
   });
 }
 
-async function buildRecentResponse(interaction, env) {
+export async function buildRecentResponse(interaction, env) {
   const riotId = parseRiotId(optionValue(interaction, "summoner", ""));
   const count = Math.max(1, Math.min(10, Number(optionValue(interaction, "count", 5))));
   const region = getRegion(interaction);
+  const mode = getMode(interaction);
   const account = await resolveAccount(env, riotId, region);
-  const matchIds = await getMatchIds(env, account.puuid, region, { count });
+  const matchIds = await getMatchIds(env, account.puuid, region, { count, queue: mode });
   const matches = await getMatches(env, matchIds, region);
   const stats = aggregateMatches(matches, account.puuid, 1);
   const canonicalId = `${account.gameName ?? riotId.gameName}#${account.tagLine ?? riotId.tagLine}`;
+  const catalog = await getChampionCatalog();
 
-  const description = stats.rows.length
-    ? stats.rows
-        .map(
-          (row) =>
-            `${row.win ? "🟢" : "🔴"} **${row.champion}** • ${row.kills}/${row.deaths}/${row.assists} • ${row.queue} • ${formatDuration(row.duration)}\n${formatEasternDate(row.timestamp)}`,
-        )
-        .join("\n\n")
-    : "No recent League games found.";
+  const description = `No recent games returned by Riot.${modeNote(mode) ? `\n${modeNote(mode)}` : ""}`;
 
   return message("", {
-    embeds: [
+    embeds: stats.rows.length ? stats.rows.map((row, index) => ({
+      title: index === 0 ? `${canonicalId} — recent games` : `${canonicalId} — ${index + 1}/${stats.rows.length}`,
+      color: row.win ? 0x2ecc71 : 0xe05d6f,
+      description: `**${row.champion} • ${row.win ? "WIN" : "LOSS"}**\n${row.queue} • ${formatDuration(row.duration)}\n${metricsSummary(row.metrics)}\n${formatEasternDate(row.timestamp)}`,
+      ...championThumbnail(catalog, row.championId ?? row.champion),
+      footer: { text: `${region.label} • America/New_York` },
+    })) : [
       {
         color: 0x5383e8,
         title: `${canonicalId} — recent games`,
         description,
-        footer: { text: `${region.label} • America/New_York` },
+        footer: { text: `${region.label} • ${mode ? queueName(mode) : "All modes"} • America/New_York` },
       },
     ],
   });
-}
-
-async function getChampionNames() {
-  try {
-    const realm = await cachedJson(
-      "https://ddragon.leagueoflegends.com/realms/na.json",
-      {},
-      86400,
-    );
-    const champions = await cachedJson(
-      `https://ddragon.leagueoflegends.com/cdn/${encodeURIComponent(realm.v)}/data/en_US/champion.json`,
-      {},
-      86400,
-    );
-    return new Map(
-      Object.values(champions.data ?? {}).map((champion) => [
-        Number(champion.key),
-        champion.name,
-      ]),
-    );
-  } catch {
-    return new Map();
-  }
 }
 
 async function buildLiveResponse(interaction, env) {
@@ -570,9 +561,9 @@ async function buildLiveResponse(interaction, env) {
   }
 
   const participant = game.participants?.find((entry) => entry.puuid === account.puuid);
-  const championNames = await getChampionNames();
+  const championNames = await getChampionCatalog();
   const champion =
-    championNames.get(Number(participant?.championId)) ??
+    championInfo(championNames, participant?.championId)?.name ??
     `Champion ${participant?.championId ?? "unknown"}`;
   const canonicalId = `${account.gameName ?? riotId.gameName}#${account.tagLine ?? riotId.tagLine}`;
   const start = Number(game.gameStartTime) || Date.now();
@@ -582,6 +573,7 @@ async function buildLiveResponse(interaction, env) {
       {
         color: 0x57b15b,
         title: `${canonicalId} — Live`,
+        ...championThumbnail(championNames, participant?.championId),
         fields: [
           { name: "Champion", value: champion, inline: true },
           {
@@ -626,7 +618,12 @@ function helpResponse() {
           {
             name: "More examples",
             value:
-              "`/stats summoner:Faker#KR1 region:Korea days:30`\n`/recent summoner:HelloThere#9494 count:10`\n`/live summoner:Knaye East#YEEZY`",
+              "`/stats summoner:HelloThere#9494 mode:ARAM`\n`/recent summoner:TIXBS Chaos#NA1 mode:ARAM Mayhem`\n`/live summoner:Knaye East#YEEZY`",
+            inline: false,
+          },
+          {
+            name: "Monitor & data",
+            value: "Live games, completed results and Solo/Duo + Flex demotions are posted automatically. Choose a summoner suggestion or enter any Riot ID.\nARAM Mayhem results depend on Riot's API; unavailable games are not invented.\n[Source & setup](https://github.com/tarun-bandi/league-stats-discord-bot)",
             inline: false,
           },
         ],

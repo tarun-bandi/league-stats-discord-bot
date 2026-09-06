@@ -1,3 +1,5 @@
+import { MODE_CHOICES } from "./league.js";
+
 export const REGION_CHOICES = [
   ["NA", "na"],
   ["EU West", "euw"],
@@ -38,6 +40,11 @@ const regionOption = {
   choices: REGION_CHOICES.map(([name, value]) => ({ name, value })),
 };
 
+const modeOption = {
+  name: "mode", description: "Filter by game mode (defaults to all modes)",
+  type: 4, required: false, choices: MODE_CHOICES,
+};
+
 export const COMMANDS = [
   {
     name: "help",
@@ -61,6 +68,7 @@ export const COMMANDS = [
         max_value: 30,
       },
       regionOption,
+      modeOption,
     ],
   },
   {
@@ -79,6 +87,7 @@ export const COMMANDS = [
         max_value: 10,
       },
       regionOption,
+      modeOption,
     ],
   },
   {

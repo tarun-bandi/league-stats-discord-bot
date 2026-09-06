@@ -355,7 +355,7 @@ test("commitMonitorChanges rebuilds every record in a grouped bot message", asyn
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0][1].method, "PATCH");
-  const description = JSON.parse(calls[0][1].body).embeds[0].description;
+  const description = JSON.parse(calls[0][1].body).embeds.map((embed) => embed.description).join("\n");
   assert.match(description, /HelloThere#9494/);
   assert.match(description, /TIXBS Chaos#NA1/);
   assert.match(description, /Kassadin/);

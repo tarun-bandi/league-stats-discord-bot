@@ -1,3 +1,9 @@
+import { queueName, matchMetrics, metricsSummary } from "./league.js";
+import { brandedEmbed } from "./branding.js";
+import { observeRanks, rankLabel, RANK_POLL_MS } from "./ranks.js";
+import { syncDiscordApplication } from "./application.js";
+import { getChampionCatalog, championInfo } from "./champions.js";
+
 const STATE_KEY = "league-game-monitor";
 const DISCORD_API = "https://discord.com/api/v10";
 const EASTERN_TIME_ZONE = "America/New_York";
@@ -12,25 +18,6 @@ const NA_REGION = {
 };
 
 const ENABLED_VALUES = new Set(["1", "true", "yes", "on"]);
-
-const QUEUES = {
-  0: "Custom",
-  400: "Normal Draft",
-  420: "Ranked Solo/Duo",
-  430: "Normal Blind",
-  440: "Ranked Flex",
-  450: "ARAM",
-  490: "Quickplay",
-  700: "Clash",
-  830: "Co-op vs. AI",
-  840: "Co-op vs. AI",
-  850: "Co-op vs. AI",
-  900: "URF",
-  1020: "One for All",
-  1300: "Nexus Blitz",
-  1400: "Ultimate Spellbook",
-  1700: "Arena",
-};
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -72,6 +59,9 @@ function validateTracker(tracker, label) {
   }
   if (!isObject(tracker.reported_games)) {
     throw new Error(`${label} reported-games map is invalid`);
+  }
+  for (const key of ["rank_snapshot", "reported_rank_changes"]) {
+    if (tracker[key] !== undefined && !isObject(tracker[key])) throw new Error(`${label} ${key} is invalid`);
   }
 }
 
@@ -120,10 +110,6 @@ export function monitorConfiguration(env) {
     enabled: monitorEnabled(env),
     transport: "bot",
   };
-}
-
-function queueName(queueId, fallback = "League game") {
-  return QUEUES[queueId] ?? fallback;
 }
 
 function formatDuration(seconds) {
@@ -202,50 +188,6 @@ async function riotJson(
   return response.json();
 }
 
-async function publicJson(url, ttlSeconds) {
-  const cache = globalThis.caches?.default;
-  const request = new Request(url);
-  if (cache) {
-    const cached = await cache.match(request);
-    if (cached) return cached.json();
-  }
-  const response = await fetch(request);
-  if (!response.ok) throw new Error(`Public data failed with HTTP ${response.status}`);
-  const body = await response.json();
-  if (cache) {
-    await cache.put(
-      request,
-      new Response(JSON.stringify(body), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": `public, max-age=${ttlSeconds}`,
-        },
-      }),
-    );
-  }
-  return body;
-}
-
-async function championNames() {
-  try {
-    const realm = await publicJson(
-      "https://ddragon.leagueoflegends.com/realms/na.json",
-      86400,
-    );
-    const champions = await publicJson(
-      `https://ddragon.leagueoflegends.com/cdn/${encodeURIComponent(realm.v)}/data/en_US/champion.json`,
-      86400,
-    );
-    return new Map(
-      Object.values(champions.data ?? {}).map((champion) => [
-        Number(champion.key),
-        champion.name,
-      ]),
-    );
-  } catch {
-    return new Map();
-  }
-}
 
 async function resolveTrackedAccount(env, tracker, detectionMs) {
   const summoner = tracker.summoner;
@@ -308,7 +250,7 @@ function participantFor(match, puuid) {
   return match.info?.participants?.find((entry) => entry.puuid === puuid);
 }
 
-function completedGame(match, tracker, detectionIso) {
+export function completedGame(match, tracker, detectionIso) {
   const puuid = tracker.summoner.puuid;
   const participant = participantFor(match, puuid);
   if (!participant) throw new Error("Tracked summoner is missing from Riot match data");
@@ -319,7 +261,10 @@ function completedGame(match, tracker, detectionIso) {
   return {
     status: "completed",
     champion: participant.championName || "Unknown",
+    champion_id: participant.championId,
     queue: queueName(match.info?.queueId, match.info?.gameMode),
+    queue_id: match.info?.queueId,
+    metrics: matchMetrics(participant, Number(match.info?.gameDuration) || 0),
     start_time: new Date(startMs).toISOString(),
     result: participant.win ? "WIN" : "LOSS",
     duration: formatDuration(match.info?.gameDuration),
@@ -408,6 +353,9 @@ export async function reconcilePendingLiveGames(
         allowNotFound: true,
       });
     } catch (error) {
+      // Mayhem match details may be forbidden even with a healthy credential.
+      // Every tracker still checks Spectator-v5, so an expired key fails the run.
+      if (error?.httpStatus === 403 && record.queue_id === 2400 && !isStaleLiveRecord(record, detectionIso)) continue;
       if (error?.httpStatus !== 403 || !isStaleLiveRecord(record, detectionIso)) {
         throw error;
       }
@@ -555,9 +503,11 @@ async function activeGame(env, tracker, detectionIso, names) {
   return {
     status: "live",
     champion:
-      names.get(Number(participant.championId)) ??
+      championInfo(names, participant.championId)?.name ??
       `Champion ${participant.championId ?? "unknown"}`,
+    champion_icon_url: championInfo(names, participant.championId)?.icon,
     queue: queueName(game.gameQueueConfigId, game.gameMode),
+    queue_id: game.gameQueueConfigId,
     start_time: new Date(startMs).toISOString(),
     detected_at: detectionIso,
     live_game_id: gameId,
@@ -586,6 +536,9 @@ function addLiveUpdate(tracker, game) {
 }
 
 function renderGame(riotId, record) {
+  if (record.kind === "demotion") {
+    return `**${riotId} — Demoted**\n${record.queue}\n${rankLabel(record.from_rank)} → **${rankLabel(record.to_rank)}**\nDetected: ${formatEasternDate(record.detected_at)}`;
+  }
   const lines = [
     `**${riotId}**`,
     `${record.champion} • ${record.queue}`,
@@ -596,26 +549,25 @@ function renderGame(riotId, record) {
     lines.push("Status: **Live**");
   } else {
     lines.push(`Result: **${record.result}** • Duration: ${record.duration}`);
+    if (metricsSummary(record.metrics)) lines.push(metricsSummary(record.metrics));
   }
   return lines.join("\n");
 }
 
 export function monitorPayload(items) {
-  const description = items
-    .map(({ riotId, record }) => renderGame(riotId, record))
-    .join("\n\n");
-  if (!description || description.length > 4000) {
+  const embeds = items.map(({ riotId, record }) => brandedEmbed({
+    color: record.kind === "demotion" || record.result === "LOSS" ? 0xe05d6f : record.result === "WIN" ? 0x2ecc71 : 0x5383e8,
+    title: record.kind === "demotion" ? "Rank update" : "League Game Monitor",
+    description: renderGame(riotId, record),
+    ...(record.champion_icon_url ? { thumbnail: { url: record.champion_icon_url } } : {}),
+  }));
+  const totalLength = embeds.reduce((sum, embed) => sum + embed.title.length + embed.description.length + embed.author.name.length + embed.footer.text.length, 0);
+  if (!embeds.length || embeds.length > 10 || totalLength > 6000) {
     throw new Error("Discord monitor payload is empty or too large");
   }
   return {
     content: "",
-    embeds: [
-      {
-        color: 0x5383e8,
-        title: "League Game Monitor",
-        description,
-      },
-    ],
+    embeds,
     allowed_mentions: EMPTY_MENTIONS,
   };
 }
@@ -742,7 +694,7 @@ export async function smokeDiscordBot(env, fetchImpl = fetch) {
 function recordsForMessage(state, messageId) {
   const records = [];
   for (const { tracker } of trackerEntries(state)) {
-    for (const record of Object.values(tracker.reported_games)) {
+    for (const record of [...Object.values(tracker.reported_games), ...Object.values(tracker.reported_rank_changes ?? {})]) {
       if (String(record.discord_message_id ?? "") === String(messageId)) {
         records.push({ riotId: tracker.summoner.riot_id, record });
       }
@@ -845,6 +797,14 @@ export async function monitorStatus(env) {
       0,
     ),
     summoners: trackerEntries(state).map(({ tracker }) => tracker.summoner.riot_id),
+    rankMonitoring: {
+      queues: ["Ranked Solo/Duo", "Ranked Flex"],
+      baselineReady: trackerEntries(state).every(({ tracker }) => Boolean(tracker.rank_checked_at)),
+      lastCheckedAt: trackerEntries(state).map(({ tracker }) => tracker.rank_checked_at ?? null),
+    },
+    application: {
+      commandsSynced: Boolean(state.discord?.command_schema_hash),
+    },
   };
 }
 
@@ -866,7 +826,7 @@ export async function runLeagueMonitor(env, options = {}) {
     const previous = await readState(env.MONITOR_DB);
     const state = structuredClone(previous);
     const detectionIso = new Date(detectionMs).toISOString();
-    const names = await championNames();
+    const names = await getChampionCatalog();
     const newAlerts = [];
     const patchTargets = new Map();
 
@@ -878,6 +838,7 @@ export async function runLeagueMonitor(env, options = {}) {
         detectionIso,
       );
       for (const game of reconciled) {
+        game.record.champion_icon_url = championInfo(names, game.record.champion_id ?? game.record.champion)?.icon ?? game.record.champion_icon_url;
         if (game.patch_message_id) {
           patchTargets.set(String(game.patch_message_id), {
             messageId: String(game.patch_message_id),
@@ -887,6 +848,7 @@ export async function runLeagueMonitor(env, options = {}) {
       }
       const completed = await completedUpdates(env, tracker, detectionIso);
       for (const game of completed) {
+        if (game.record) game.record.champion_icon_url = championInfo(names, game.champion_id ?? game.champion)?.icon ?? game.record.champion_icon_url;
         if (game.is_new_alert) {
           newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: game.record });
         }
@@ -907,8 +869,18 @@ export async function runLeagueMonitor(env, options = {}) {
           record: newLive.record,
         });
       }
+      const lastRankMs = Date.parse(tracker.rank_checked_at ?? "");
+      if (!Number.isFinite(lastRankMs) || detectionMs - lastRankMs >= RANK_POLL_MS ||
+          completed.some((game) => [420, 440].includes(game.queue_id))) {
+        const ranked = await riotJson(env,
+          `https://${NA_REGION.platform}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(tracker.summoner.puuid)}`);
+        for (const record of observeRanks(tracker, ranked, detectionIso)) {
+          newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record });
+        }
+      }
     }
 
+    await syncDiscordApplication(env, state);
     await commitMonitorChanges(env, {
       state,
       owner,
