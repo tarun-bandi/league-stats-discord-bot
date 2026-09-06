@@ -49,7 +49,26 @@ const privateOption = { name: "private", description: "Show the response only to
 const requiredSummoner = { ...riotIdOption, required: true };
 const trackerCommand = (name, description) => ({ name, description, type: 1, options: [requiredSummoner] });
 
+const daysOption = { name: "days", description: "Rolling period: 1–30 days (default 7)", type: 4, min_value: 1, max_value: 30 };
+export const LEADERBOARD_METRICS = [
+  ["Win rate", "winRate"], ["KDA", "kda"], ["CS/min", "csPerMinute"],
+  ["Damage/min", "averageDamagePerMinute"], ["Average vision", "averageVision"],
+  ["Hours played", "hours"], ["Games played", "games"],
+];
+
 export const COMMANDS = [
+  {
+    name: "leaderboard", type: 1, description: "Rank the active tracked roster; load players in batches", dm_permission: false,
+    options: [
+      { name: "metric", description: "Sort by (default win rate)", type: 3, choices: LEADERBOARD_METRICS.map(([name, value]) => ({ name, value })) },
+      daysOption, modeOption,
+      { name: "min_games", description: "Minimum sampled games to qualify (default 5)", type: 4, min_value: 1, max_value: 30 }, privateOption,
+    ],
+  },
+  {
+    name: "compare", type: 1, description: "Compare two players over the same period and game mode", dm_permission: false,
+    options: [{ ...requiredSummoner, name: "opponent", description: "Other player's Riot ID" }, riotIdOption, daysOption, regionOption, modeOption, privateOption],
+  },
   {
     name: "help",
     type: 1,
