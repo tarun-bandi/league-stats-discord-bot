@@ -10,7 +10,7 @@ import {
 } from "./monitor.js";
 import { MODE_CHOICES, queueName, modeNote, matchMetrics, metricsSummary } from "./league.js";
 import { brandedEmbed } from "./branding.js";
-import { getChampionCatalog, championInfo, championThumbnail } from "./champions.js";
+import { getChampionCatalog, championInfo, championThumbnail, championAutocompleteChoices } from "./champions.js";
 import { riotKeyFingerprint } from "./riot-key.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
@@ -89,6 +89,10 @@ export function summonerAutocompleteChoices(
 
 export async function autocompleteResponse(interaction, env) {
   const focused = interaction.data?.options?.find((option) => option.focused);
+  if (focused?.name === "champion" && interaction.data?.name === "stats") {
+    const catalog = await getChampionCatalog();
+    return json({ type: 8, data: { choices: championAutocompleteChoices(catalog, focused.value) } });
+  }
   if (
     focused?.name !== "summoner" ||
     !["stats", "recent", "live"].includes(interaction.data?.name)
@@ -447,6 +451,18 @@ export async function buildStatsResponse(interaction, env) {
   const days = Math.max(1, Math.min(30, Number(optionValue(interaction, "days", 7))));
   const region = getRegion(interaction);
   const mode = getMode(interaction);
+  const championInput = optionValue(interaction, "champion", null);
+  const catalog = await getChampionCatalog();
+  let champion;
+  if (championInput !== null) {
+    if (!catalog.size) {
+      throw new UserFacingError("Champion names are temporarily unavailable. Try again shortly, or omit the champion option for overall stats.");
+    }
+    champion = championInfo(catalog, championInput);
+    if (!champion) {
+      throw new UserFacingError("Unknown champion. Choose a champion suggestion or enter its full name, such as Cho'Gath or Wukong.");
+    }
+  }
   const account = await resolveAccount(env, riotId, region);
   const startTime = Math.floor((Date.now() - days * 86400_000) / 1000);
 
@@ -459,22 +475,28 @@ export async function buildStatsResponse(interaction, env) {
     getRankedEntries(env, account.puuid, region),
   ]);
   const matches = await getMatches(env, matchIds, region);
-  const stats = aggregateMatches(matches, account.puuid, days);
+  const selectedMatches = champion ? matches.filter((match) => {
+    const participant = participantFor(match, account.puuid);
+    return participant && championInfo(catalog, participant.championId ?? participant.championName)?.id === champion.id;
+  }) : matches;
+  const stats = aggregateMatches(selectedMatches, account.puuid, days);
   const canonicalId = `${account.gameName ?? riotId.gameName}#${account.tagLine ?? riotId.tagLine}`;
   const capped = matchIds.length === MAX_STATS_MATCHES;
-  const catalog = await getChampionCatalog();
+  const sampleNote = champion
+    ? `\n${stats.games} ${champion.name} game${stats.games === 1 ? "" : "s"} in the ${matchIds.length} newest game${matchIds.length === 1 ? "" : "s"} returned for this period${mode ? " and mode" : ""}.${capped ? " Older champion games may not be included." : ""}`
+    : "";
 
   return message("", {
     embeds: [
       {
         color: 0x5383e8,
-        title: `${canonicalId} — last ${days} day${days === 1 ? "" : "s"}`,
-        ...championThumbnail(catalog, stats.topChampions[0]?.name),
-        description: stats.games
+        title: `${canonicalId} — ${champion ? `${champion.name} • ` : ""}last ${days} day${days === 1 ? "" : "s"}`,
+        ...championThumbnail(catalog, champion?.id ?? stats.topChampions[0]?.name),
+        description: (stats.games
           ? `**${stats.wins}W–${stats.losses}L • ${formatPercent(stats.winRate)} win rate**`
-          : `No League games returned by Riot in this period.${modeNote(mode) ? `\n${modeNote(mode)}` : ""}`,
+          : `${champion ? `No ${champion.name} games found in this sample.` : "No League games returned by Riot in this period."}${modeNote(mode) ? `\n${modeNote(mode)}` : ""}`) + sampleNote,
         fields: [
-          { name: "Rank", value: rankedSummary(rankedEntries), inline: false },
+          { name: champion ? "Account rank (all champions)" : "Rank", value: rankedSummary(rankedEntries), inline: false },
           {
             name: "Games per day",
             value: `${stats.calendarGamesPerDay.toFixed(2)} calendar avg • ${stats.activeGamesPerDay.toFixed(2)} on ${stats.activeDays} active day${stats.activeDays === 1 ? "" : "s"}`,
@@ -487,7 +509,7 @@ export async function buildStatsResponse(interaction, env) {
           },
           {
             name: "Pace",
-            value: `${formatDuration(stats.averageDuration)} avg game • ${stats.streak} current streak`,
+            value: `${formatDuration(stats.averageDuration)} avg game • ${stats.streak} ${champion ? "champion" : "current"} streak`,
             inline: false,
           },
           {
@@ -500,11 +522,11 @@ export async function buildStatsResponse(interaction, env) {
             ].filter(Boolean).join(" • ") || "Not supplied by Riot for these games",
             inline: false,
           },
-          {
+          ...(!champion ? [{
             name: "Top champions",
             value: topChampionSummary(stats.topChampions),
             inline: false,
-          },
+          }] : []),
         ],
         footer: {
           text: `${region.label} • ${mode ? queueName(mode) : "All modes"} • America/New_York${capped ? ` • Capped at the ${MAX_STATS_MATCHES} newest games` : ""}`,
@@ -616,18 +638,18 @@ function helpResponse() {
           {
             name: "Commands",
             value:
-              "`/stats` — win rate, games/day, rank, KDA, CS/min, champions\n`/recent` — recent match list\n`/live` — current game status\n`/ping` — bot health",
+              "`/stats` — win rate, games/day, rank, KDA, CS/min; optional champion filter\n`/recent` — recent match list\n`/live` — current game status\n`/ping` — bot health",
             inline: false,
           },
           {
             name: "More examples",
             value:
-              "`/stats summoner:HelloThere#9494 mode:ARAM`\n`/recent summoner:TIXBS Chaos#NA1 mode:ARAM Mayhem`\n`/live summoner:Knaye East#YEEZY`",
+              "`/stats summoner:HelloThere#9494 champion:Zed days:30`\n`/stats summoner:HelloThere#9494 champion:Cho'Gath mode:ARAM`\n`/recent summoner:TIXBS Chaos#NA1 mode:ARAM Mayhem`\n`/live summoner:Knaye East#YEEZY`",
             inline: false,
           },
           {
             name: "Monitor & data",
-            value: "Live games, completed results and Solo/Duo + Flex demotions are posted automatically. Choose a summoner suggestion or enter any Riot ID.\nARAM Mayhem results depend on Riot's API; unavailable games are not invented.\n[Source & setup](https://github.com/tarun-bandi/league-stats-discord-bot)",
+            value: "Live games, completed results and Solo/Duo + Flex demotions are posted automatically. Choose a summoner suggestion or enter any Riot ID.\nChampion stats filter the newest 30 games for your period/mode; rank remains account-wide.\nARAM Mayhem results depend on Riot's API; unavailable games are not invented.\n[Source & setup](https://github.com/tarun-bandi/league-stats-discord-bot)",
             inline: false,
           },
         ],

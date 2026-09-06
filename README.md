@@ -17,6 +17,7 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 - Discord mentions disabled in every response
 - Solo/Duo and Flex demotion alerts (tier/division drops, not LP fluctuations)
 - Game-mode filters, including ARAM Mayhem, with current queue labels
+- Optional `/stats champion` filter with champion-name autocomplete
 - Damage, vision, gold, placement and pentakill details where Riot supplies them
 - Champion portraits on recent-game cards, live/completed alerts, live responses and stats
 - Automatic slash-command registration after a deployment
@@ -26,13 +27,21 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 ```text
 /stats summoner:HelloThere#9494
 /stats summoner:TIXBS Chaos#NA1 mode:ARAM
+/stats summoner:HelloThere#9494 champion:Zed days:30
 /recent summoner:Knaye East#YEEZY mode:ARAM Mayhem
 /live summoner:HelloThere#9494
 ```
 
 Select `summoner` to see the three monitored accounts. Any valid Riot ID still
 works. `mode` defaults to all modes; stats cover seven days by default and at most
-30 matches. Riot may not expose completed ARAM Mayhem matches. See the
+30 matches. Add `champion` to get that champion's win rate, KDA, CS/min, games/day
+and impact stats, with its portrait. Champion names are suggested as you type;
+punctuation/case and canonical aliases such as Cho'Gath/Chogath and
+Wukong/MonkeyKing are accepted. It combines with `days`, `mode` and `region`.
+Champion filtering applies **within the newest 30 games returned for the chosen
+period and mode**, not the newest 30 games on that champion. The response labels
+the sample; older champion games may be excluded. Rank stays account-wide.
+Omit `champion` for the existing overall stats. Riot may not expose completed ARAM Mayhem matches. See the
 [payload and mode guide](docs/payload.md) for exactly what we can show.
 
 ## Cloudflare bindings

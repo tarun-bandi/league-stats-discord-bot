@@ -20,6 +20,7 @@ export function catalogFromData(version, data) {
   for (const champion of Object.values(data ?? {})) {
     if (!/^[A-Za-z0-9]+$/.test(champion.id)) continue;
     const entry = {
+      id: champion.id,
       name: champion.name,
       icon: `https://ddragon.leagueoflegends.com/cdn/${version}/img/champion/${champion.id}.png`,
     };
@@ -30,6 +31,18 @@ export function catalogFromData(version, data) {
 
 export function championInfo(catalog, nameOrId) {
   return catalog.get(String(nameOrId)) ?? catalog.get(normalize(nameOrId));
+}
+
+export function championAutocompleteChoices(catalog, input) {
+  const query = normalize(input);
+  return [...new Set(catalog.values())]
+    .filter((champion) => [champion.name, champion.id].some((name) => normalize(name).includes(query)))
+    .sort((a, b) => {
+      const prefix = (champion) => [champion.name, champion.id].some((name) => normalize(name).startsWith(query));
+      return Number(prefix(b)) - Number(prefix(a)) || a.name.localeCompare(b.name);
+    })
+    .slice(0, 25)
+    .map((champion) => ({ name: champion.name, value: champion.name }));
 }
 
 export function championThumbnail(catalog, nameOrId) {

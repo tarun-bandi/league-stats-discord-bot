@@ -69,6 +69,15 @@ export const COMMANDS = [
       },
       regionOption,
       modeOption,
+      {
+        name: "champion",
+        description: "Champion-specific stats within the newest 30 games; type a name",
+        type: 3,
+        required: false,
+        autocomplete: true,
+        min_length: 1,
+        max_length: 100,
+      },
     ],
   },
   {

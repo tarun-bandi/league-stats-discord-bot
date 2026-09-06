@@ -20,10 +20,29 @@ Arena placement is shown separately from Riot's win flag.
 
 Champion portraits come from Riot Data Dragon's current champion catalog. Every
 `/recent` game and monitor game uses its own thumbnail; `/live` uses the current
-champion and `/stats` uses the most-played champion. Canonical IDs handle names
+champion and `/stats` uses the selected champion, or the most-played champion
+when no filter is set. Canonical IDs handle names
 such as Cho'Gath and Wukong correctly. Portrait data is cached for 24 hours;
 artwork failure leaves the text result working. No Discord bot-avatar change is
 required. Ten recent games use ten embeds, within Discord's message limits.
+
+## Champion stats
+
+`/stats champion:Zed` filters every match-derived metric to that champion for the
+requested summoner. It combines with the period, region and mode options and
+shows the matching-game count plus games examined. Rank remains account-wide
+and is labeled accordingly. The streak only covers that champion's games.
+
+The filter is applied **after fetching at most 30 games** for the period/mode.
+It is a bounded sample, not lifetime champion stats or the newest 30 games played
+on that champion. Capped responses explicitly warn that older champion games
+may be missing. No-match responses do not substitute overall stats.
+
+Autocomplete uses the cached Data Dragon catalog, without Riot account calls.
+Names are case/punctuation insensitive and canonical IDs such as `MonkeyKing`
+resolve to Wukong. Invalid names return a clear error. If the catalog is down,
+champion-filtered requests ask the user to retry rather than silently dropping
+the filter; unfiltered stats still work without artwork.
 
 ## Modes
 
