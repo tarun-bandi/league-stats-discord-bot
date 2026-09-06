@@ -213,7 +213,7 @@ export async function resolveTrackedAccount(env, tracker, detectionMs, { force =
     if (summoner.puuid && account.puuid !== summoner.puuid) {
       // A renamed/reused Riot ID must not silently switch the tracked player.
       // Prove continuity against a previously saved Riot match before rebinding.
-      const anchor = [tracker.newest_completed_match?.id,
+      const anchor = [tracker.newest_completed_match?.id, tracker.riot_newest_completed_match_id,
         ...Object.values(tracker.reported_games).map((record) => record.match_id)]
         .find((id) => /^NA1_\d+$/.test(id ?? ""));
       if (!anchor) throw new Error("Cannot verify tracked account after Riot key change: no saved Riot match");

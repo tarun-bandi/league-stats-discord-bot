@@ -53,6 +53,21 @@ test("reused Riot ID cannot silently replace the tracked account", async (t) => 
   assert.equal(JSON.stringify(saved), before);
 });
 
+test("legacy OP.GG cursors can verify identity using their saved Riot cursor", async (t) => {
+  const saved = tracker();
+  saved.newest_completed_match.id = "legacy-opgg-id";
+  saved.reported_games = {};
+  t.mock.method(globalThis, "fetch", async (url) => {
+    if (url.includes("by-puuid")) return new Response(null, { status: 400 });
+    if (url.includes("by-riot-id")) return Response.json({ puuid: "new-A", gameName: "A", tagLine: "NA1" });
+    assert.ok(url.endsWith("/matches/NA1_1"));
+    return Response.json({ info: { participants: [{ puuid: "new-A" }] } });
+  });
+  await resolveTrackedAccount({ RIOT_API_KEY: "synthetic" }, saved, Date.parse(at), { force: true });
+  assert.equal(saved.summoner.puuid, "new-A");
+  assert.equal(saved.newest_completed_match.id, "legacy-opgg-id");
+});
+
 test("expired credentials do not trigger identity rebinding", async (t) => {
   const saved = tracker();
   const before = JSON.stringify(saved);
