@@ -1,3 +1,6 @@
+import { UserFacingError, RiotRateLimitError } from "./errors.js";
+import { cacheKey, cacheRead, cacheWrite, checkRiotCooldown, recordRiotCooldown } from "./data-cache.js";
+import { buildOpggResponse } from "./opgg.js";
 import {
   COMMANDS,
   MONITORED_SUMMONER_DEFAULTS,
@@ -43,7 +46,7 @@ const REGIONS = {
   vn: { platform: "vn2", regional: "sea", label: "VN" },
 };
 
-export class UserFacingError extends Error {}
+export { UserFacingError } from "./errors.js";
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -208,7 +211,7 @@ export function getMode(interaction) {
   return value;
 }
 
-async function cachedJson(url, init, ttlSeconds, cacheScope = "") {
+async function cachedJson(url, init, ttlSeconds, cacheScope = "", env = null) {
   const cache = globalThis.caches?.default;
   const cacheUrl = new URL(url);
   if (cacheScope) cacheUrl.searchParams.set("__leaguestats_credential", cacheScope);
@@ -218,7 +221,9 @@ async function cachedJson(url, init, ttlSeconds, cacheScope = "") {
     if (cached) return cached.json();
   }
 
+  if (env) await checkRiotCooldown(env, url);
   const response = await fetch(url, init);
+  if (env && response.status === 429) throw await recordRiotCooldown(env, url, response.headers.get("Retry-After"));
   if (!response.ok) {
     const error = new Error(`HTTP ${response.status}`);
     error.status = response.status;
@@ -249,6 +254,7 @@ async function riotJson(env, url, ttlSeconds = 0) {
       { headers: { "X-Riot-Token": env.RIOT_API_KEY } },
       ttlSeconds,
       ttlSeconds > 0 ? await riotKeyFingerprint(env.RIOT_API_KEY) : "",
+      env,
     );
   } catch (error) {
     if (error instanceof UserFacingError) throw error;
@@ -300,11 +306,27 @@ async function getMatch(env, matchId, region) {
   return riotJson(env, url);
 }
 
-async function getMatches(env, matchIds, region) {
+async function getMatches(env, matchIds, region, puuid) {
+  const scope = await cacheKey("match-scope", [env.RIOT_API_KEY, region.regional, puuid]);
+  const cachedMatch = async (id) => {
+    const key = `${scope}:${id}`;
+    const cached = await cacheRead(env, key);
+    if (cached?.metadata?.matchId === id && participantFor(cached, puuid)) return cached;
+    const raw = await getMatch(env, id, region);
+    if (participantFor(raw, puuid)) {
+      const compact = compactMatches([raw], puuid)[0];
+      await cacheWrite(env, key, compact, 7 * 86400_000);
+      return compact;
+    }
+    return raw;
+  };
   const matches = [];
   for (let index = 0; index < matchIds.length; index += 10) {
     const chunk = matchIds.slice(index, index + 10);
-    matches.push(...(await Promise.all(chunk.map((id) => getMatch(env, id, region)))));
+    const settled = await Promise.allSettled(chunk.map(cachedMatch));
+    const failed = settled.find((result) => result.status === "rejected");
+    if (failed) throw failed.reason;
+    matches.push(...settled.map((result) => result.value));
     if (index + 10 < matchIds.length) {
       await new Promise((resolve) => setTimeout(resolve, 650));
     }
@@ -330,7 +352,7 @@ export async function loadMoreMatches(interaction, env, snapshot, count = 30) {
   const ids = await getMatchIds(env, snapshot.account.puuid, region, { count, start: snapshot.offset,
     startTime: snapshot.startTime, endTime: snapshot.endTime, queue: getMode(interaction) });
   const seen = new Set(snapshot.matches.map((match) => match.metadata.matchId));
-  const matches = await getMatches(env, [...new Set(ids)].filter((id) => !seen.has(id)), region);
+  const matches = await getMatches(env, [...new Set(ids)].filter((id) => !seen.has(id)), region, snapshot.account.puuid);
   snapshot.matches.push(...compactMatches(matches, snapshot.account.puuid));
   snapshot.offset += ids.length;
   snapshot.more = ids.length === count;
@@ -503,7 +525,7 @@ export async function buildStatsResponse(interaction, env, snapshot = null) {
     }),
     getRankedEntries(env, account.puuid, region),
   ]);
-  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region);
+  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region, account.puuid);
   if (snapshot && !snapshot.matches) Object.assign(snapshot, { account, startTime, endTime, rankedEntries,
     matches: compactMatches(matches, account.puuid), offset: matchIds.length, more: matchIds.length === MAX_STATS_MATCHES });
   const selectedMatches = champion ? matches.filter((match) => {
@@ -575,7 +597,7 @@ export async function buildRecentResponse(interaction, env, snapshot = null) {
   const account = snapshot?.account ?? await resolveAccount(env, riotId, region);
   const endTime = snapshot?.endTime ?? Math.floor(Date.now() / 1000);
   const matchIds = snapshot?.matches ? snapshot.matches.map((match) => match.metadata.matchId) : await getMatchIds(env, account.puuid, region, { count, queue: mode, endTime });
-  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region);
+  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region, account.puuid);
   if (snapshot && !snapshot.matches) Object.assign(snapshot, { account, endTime, matches: compactMatches(matches, account.puuid), offset: matchIds.length, more: matchIds.length === count });
   const page = snapshot?.page ?? 0;
   const allRows = aggregateMatches(matches, account.puuid, 1);
@@ -713,7 +735,11 @@ async function runDeferredCommand(interaction, env, context) {
       case "stats":
       case "recent":
       case "session":
-        payload = await createLookup(interaction, env);
+        try { payload = await createLookup(interaction, env); }
+        catch (error) {
+          if (!(error instanceof RiotRateLimitError)) throw error;
+          payload = await buildOpggResponse(interaction, env);
+        }
         break;
       case "compare":
       case "leaderboard":

@@ -12,7 +12,7 @@ function mockPlayers(t, { count = 30, fail = () => false, onRequest = () => {} }
     const url = new URL(input instanceof Request ? input.url : input);
     onRequest(url, init);
     if (url.hostname === "discord.com") return Response.json({ id: "999" });
-    if (fail(url)) return new Response(null, { status: 429 });
+    if (fail(url)) return new Response(null, { status: 503 });
     if (url.pathname.includes("accounts/by-riot-id")) {
       const name = decodeURIComponent(url.pathname.split("/").at(-2));
       return Response.json({ puuid: name, gameName: name, tagLine: "NA1" });
@@ -111,7 +111,7 @@ test("empty periods, no active roster and wrong server are explicit", async (t) 
   await assert.rejects(createSocial(interaction("leaderboard"), env), /No active/);
   await assert.rejects(createSocial(interaction("leaderboard", {}, { guild_id: "elsewhere" }), env), /tracking server/);
   const payload = await createSocial(interaction("compare", { summoner: "Test#NA1", opponent: "Other#NA1" }), env);
-  assert.ok(payload.embeds[0].fields.every((f) => /No completed games/.test(f.value)));
+  assert.ok(payload.embeds[0].fields.every((f) => /No matching games/.test(f.value)));
 });
 
 test("ten long player names stay within Discord field and embed limits", () => {
@@ -142,7 +142,7 @@ test("signed commands route, honor privacy/default account, and signed buttons r
   assert.equal(COMMANDS.find((c) => c.name === "compare").options[0].required, true);
 });
 
-test("worst-case cache misses, D1 and reply stay within 50 subrequests per interaction", async (t) => {
+test("worst-case cache misses and reply stay below 50 external requests, D1 below 1000", async (t) => {
   let requests = 0;
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, "caches");
   Object.defineProperty(globalThis, "caches", { configurable: true, value: { default: { match: async () => { requests++; }, put: async () => { requests++; } } } });
@@ -150,7 +150,8 @@ test("worst-case cache misses, D1 and reply stay within 50 subrequests per inter
   const db = testDb(stateFixture()), env = envFixture(db);
   mockPlayers(t, { onRequest: () => requests++ });
   await signedRun(interaction("compare", { summoner: "Test#NA1", opponent: "Other#NA1" }), env);
-  assert.ok(requests + db.queries <= 50, `${requests} network/cache + ${db.queries} D1`);
+  assert.ok(requests <= 50, `${requests} external/cache requests`);
+  assert.ok(db.queries <= 1000, `${db.queries} internal D1 requests`);
   // Count each private RPC separately, as Cloudflare does for each invocation.
   const costs = [];
   const rpc = { load: async (query, window) => {

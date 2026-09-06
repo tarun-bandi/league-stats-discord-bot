@@ -126,7 +126,7 @@ test("card controls change period/champion and deny other users, servers and exp
   for (const overrides of [{ guild_id: "different" }, { channel_id: "different" }, { member: { user: { id: "222" } } }]) await assert.rejects(resolveView(click(view, "more", overrides), env), /Only the person/);
   await writeRecord(db, `view:${view.id}`, view, Date.now() - 1);
   await assert.rejects(resolveView(click(view, "more"), env), /expired/);
-  await purgeExpiredRecords(db); assert.equal(db.sqlite.prepare("SELECT count(*) AS n FROM bot_records").get().n, 0);
+  await purgeExpiredRecords(db); assert.equal(db.sqlite.prepare("SELECT count(*) AS n FROM bot_records WHERE record_key LIKE 'view:%'").get().n, 0);
 });
 
 test("simultaneous clicks cannot overwrite a leased history view", async (t) => {
@@ -171,12 +171,13 @@ test("session shows today's record, time, best champion and honest observed LP",
   assert.match(observedLp([], [current], midnight), /not reconstructed/);
 });
 
-test("full interactive cold-cache stats stays within 50 subrequests including D1 and reply", async (t) => {
+test("full interactive cold-cache stats fits external and internal Worker budgets", async (t) => {
   const db = testDb(); const env = envFixture(db); let external = 0;
   const previous = Object.getOwnPropertyDescriptor(globalThis, "caches");
   Object.defineProperty(globalThis, "caches", { configurable: true, value: { default: { match: async () => { external++; }, put: async () => { external++; } } } });
   t.after(() => previous ? Object.defineProperty(globalThis, "caches", previous) : delete globalThis.caches);
   mockLookup(t, Array.from({ length: 30 }, (_, i) => game(i)), { onRequest: () => external++ });
   await signedRun(interaction("stats", { summoner: "Test#NA1" }), env);
-  assert.ok(external + db.queries <= 50, `${external + db.queries} subrequests`);
+  assert.ok(external <= 50, `${external} external/cache requests`);
+  assert.ok(db.queries <= 1000, `${db.queries} internal D1 requests`);
 });

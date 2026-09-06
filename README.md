@@ -78,6 +78,40 @@ These are sampled totals, including hours/games played, not guaranteed totals fo
 an entire week or month. Capped samples are labeled. Empty periods and unavailable
 metrics are explicit. These commands do not enroll accounts or change monitor state.
 
+## Cache and rate-limit fallback
+
+Completed Riot matches are cached in D1 for seven days, using only the requested
+player's stat fields. The cache is shared across Worker invocations and new
+stats/recent/session/compare/leaderboard views; a new view fetches missing games
+rather than downloading the same match details again. Entries are isolated by
+Riot credential fingerprint, region and player. Existing account/rank/match-list
+edge caches keep their shorter TTLs. Expired records use the existing hourly cleanup.
+
+Riot HTTP 429 responses establish a shared, per-key/per-host cooldown using
+`Retry-After` (120 seconds if missing). Both interactive lookups and the monitor
+respect it. A cache failure does not break otherwise valid lookups, and failed
+Riot responses are never cached as match data.
+
+During that cooldown, stats/recent/session/compare/leaderboard lookups can use
+OP.GG's public profile HTML. The fallback makes one bounded, six-second request,
+caches validated profile data for five minutes, checks Riot ID and region, and
+filters the available match sample by the requested period. All modes, Solo/Duo,
+Flex and ARAM are supported; ambiguous queue mappings are rejected. Champion
+filters use the existing champion catalog. It does not trigger on expired keys,
+404s or arbitrary server errors.
+
+Fallback cards link to OP.GG and show retrieval/profile-update times. OP.GG's
+public structured sample currently contains up to ten recent games, which can
+be stale or incomplete. It supplies record and KDA; duration, CS/min, damage,
+vision, rank and LP are unavailable and never estimated. Unsupported metrics do
+not qualify for leaderboards. Mixed sources are labeled because their sample
+coverage can differ. OP.GG data never advances monitor cursors or generates
+monitor alerts. The monitor and live-game lookup continue to use Riot.
+
+OP.GG errors, access denials, redirects or changed markup fail closed with a
+cached backoff, without browser challenges or private API access. Source:
+[OP.GG's crawling guidance](https://help.op.gg/hc/en-us/articles/31091405109401-Can-I-use-OP-GG-data).
+
 ## Cloudflare bindings
 
 - `DISCORD_PUBLIC_KEY` — Worker secret used to verify Discord interactions

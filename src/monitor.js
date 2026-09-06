@@ -1,3 +1,4 @@
+import { checkRiotCooldown, recordRiotCooldown } from "./data-cache.js";
 import { queueName, matchMetrics, metricsSummary } from "./league.js";
 import { brandedEmbed } from "./branding.js";
 import { observeRanks, rankLabel, RANK_POLL_MS } from "./ranks.js";
@@ -159,9 +160,11 @@ async function riotJson(
 ) {
   if (!env.RIOT_API_KEY) throw new Error("RIOT_API_KEY is not configured");
   if (env.riotBudget && env.riotBudget.remaining-- <= 0) throw Object.assign(new Error("Monitor request budget reached"), { budgetExceeded: true });
+  await checkRiotCooldown(env, url);
   const response = await fetch(url, {
     headers: { "X-Riot-Token": env.RIOT_API_KEY },
   });
+  if (response.status === 429) throw await recordRiotCooldown(env, url, response.headers.get("Retry-After"));
   if (env.riotBudget && (response.ok || response.status === 404)) env.riotBudget.successes++;
   if (allowNotFound && response.status === 404) return null;
   if (allowInvalidIdentifier && [400, 404].includes(response.status)) return null;
