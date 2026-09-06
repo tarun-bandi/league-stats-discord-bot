@@ -33,7 +33,10 @@ requested summoner. It combines with the period, region and mode options and
 shows the matching-game count plus games examined. Rank remains account-wide
 and is labeled accordingly. The streak only covers that champion's games.
 
-The filter is applied **after fetching at most 30 games** for the period/mode.
+The filter is applied **after fetching an initial 30 games** for the period/mode.
+Interactive cards can load 30 more per click, up to 300 games in a one-hour view.
+Each batch is deduplicated and keeps the original query's time boundary. Changing
+period or refreshing starts a new sample. Cached previous pages do not refetch games.
 It is a bounded sample, not lifetime champion stats or the newest 30 games played
 on that champion. Capped responses explicitly warn that older champion games
 may be missing. No-match responses do not substitute overall stats.

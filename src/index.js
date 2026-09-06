@@ -5,6 +5,7 @@ import {
 } from "./commands.js";
 import {
   monitorConfiguration,
+  monitorEnabled,
   monitorStatus,
   runLeagueMonitor,
 } from "./monitor.js";
@@ -12,6 +13,10 @@ import { MODE_CHOICES, queueName, modeNote, matchMetrics, metricsSummary } from 
 import { brandedEmbed } from "./branding.js";
 import { getChampionCatalog, championInfo, championThumbnail, championAutocompleteChoices } from "./champions.js";
 import { riotKeyFingerprint } from "./riot-key.js";
+import { readProfile, withDefaults, commandOptions, optionsObject } from "./preferences.js";
+import { createLookup, updateLookup, resolveView, championModal, profileCommand, featureMessage } from "./features.js";
+import { trackingCommand, assertMonitorAdmin } from "./tracking.js";
+import { readRecord, purgeExpiredRecords } from "./store.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const MAX_STATS_MATCHES = 30;
@@ -59,10 +64,10 @@ function immediateMessage(content, options) {
   return json({ type: 4, data: message(content, options) });
 }
 
-function deferredMessage() {
+function deferredMessage(ephemeral = false) {
   return json({
     type: 5,
-    data: { allowed_mentions: EMPTY_MENTIONS },
+    data: { allowed_mentions: EMPTY_MENTIONS, ...(ephemeral ? { flags: 64 } : {}) },
   });
 }
 
@@ -88,14 +93,14 @@ export function summonerAutocompleteChoices(
 }
 
 export async function autocompleteResponse(interaction, env) {
-  const focused = interaction.data?.options?.find((option) => option.focused);
+  const focused = commandOptions(interaction).find((option) => option.focused);
   if (focused?.name === "champion" && interaction.data?.name === "stats") {
     const catalog = await getChampionCatalog();
     return json({ type: 8, data: { choices: championAutocompleteChoices(catalog, focused.value) } });
   }
   if (
     focused?.name !== "summoner" ||
-    !["stats", "recent", "live"].includes(interaction.data?.name)
+    !["stats", "recent", "live", "session", "profile", "track"].includes(interaction.data?.name)
   ) {
     return json({ type: 8, data: { choices: [] } });
   }
@@ -278,9 +283,10 @@ async function getRankedEntries(env, puuid, region) {
   }
 }
 
-export async function getMatchIds(env, puuid, region, { count, startTime, queue }) {
-  const query = new URLSearchParams({ start: "0", count: String(count) });
+export async function getMatchIds(env, puuid, region, { count, startTime, endTime, queue, start = 0 }) {
+  const query = new URLSearchParams({ start: String(start), count: String(count) });
   if (startTime) query.set("startTime", String(startTime));
+  if (endTime) query.set("endTime", String(endTime));
   if (queue) query.set("queue", String(queue));
   const url = `https://${region.regional}.api.riotgames.com/lol/match/v5/matches/by-puuid/${encodeURIComponent(puuid)}/ids?${query}`;
   return riotJson(env, url, 45);
@@ -307,6 +313,26 @@ async function getMatches(env, matchIds, region) {
 
 function participantFor(match, puuid) {
   return match.info?.participants?.find((participant) => participant.puuid === puuid);
+}
+
+// Persist only the requested participant's public stat fields, not complete lobbies.
+export function compactMatches(matches, puuid) {
+  const fields = ["puuid", "championName", "championId", "win", "kills", "deaths", "assists", "totalMinionsKilled", "neutralMinionsKilled", "totalDamageDealtToChampions", "visionScore", "goldEarned", "pentaKills", "placement", "subteamPlacement"];
+  return matches.map((match) => ({ metadata: { matchId: match.metadata.matchId }, info: {
+    ...Object.fromEntries(["gameStartTimestamp", "gameDuration", "queueId", "gameMode"].map((key) => [key, match.info[key]])),
+    participants: [Object.fromEntries(fields.filter((key) => participantFor(match, puuid)?.[key] !== undefined).map((key) => [key, participantFor(match, puuid)[key]]))],
+  } }));
+}
+
+export async function loadMoreMatches(interaction, env, snapshot, count = 30) {
+  const region = getRegion(interaction);
+  const ids = await getMatchIds(env, snapshot.account.puuid, region, { count, start: snapshot.offset,
+    startTime: snapshot.startTime, endTime: snapshot.endTime, queue: getMode(interaction) });
+  const seen = new Set(snapshot.matches.map((match) => match.metadata.matchId));
+  const matches = await getMatches(env, [...new Set(ids)].filter((id) => !seen.has(id)), region);
+  snapshot.matches.push(...compactMatches(matches, snapshot.account.puuid));
+  snapshot.offset += ids.length;
+  snapshot.more = ids.length === count;
 }
 
 function formatPercent(value) {
@@ -446,7 +472,7 @@ function topChampionSummary(champions) {
     .join(" • ");
 }
 
-export async function buildStatsResponse(interaction, env) {
+export async function buildStatsResponse(interaction, env, snapshot = null) {
   const riotId = parseRiotId(optionValue(interaction, "summoner", ""));
   const days = Math.max(1, Math.min(30, Number(optionValue(interaction, "days", 7))));
   const region = getRegion(interaction);
@@ -463,25 +489,29 @@ export async function buildStatsResponse(interaction, env) {
       throw new UserFacingError("Unknown champion. Choose a champion suggestion or enter its full name, such as Cho'Gath or Wukong.");
     }
   }
-  const account = await resolveAccount(env, riotId, region);
-  const startTime = Math.floor((Date.now() - days * 86400_000) / 1000);
+  const account = snapshot?.account ?? await resolveAccount(env, riotId, region);
+  const startTime = snapshot?.startTime ?? Math.floor((Date.now() - days * 86400_000) / 1000);
+  const endTime = snapshot?.endTime ?? Math.floor(Date.now() / 1000);
 
-  const [matchIds, rankedEntries] = await Promise.all([
+  const [matchIds, rankedEntries] = snapshot?.matches ? [snapshot.matches.map((match) => match.metadata.matchId), snapshot.rankedEntries] : await Promise.all([
     getMatchIds(env, account.puuid, region, {
       count: MAX_STATS_MATCHES,
       startTime,
+      endTime,
       queue: mode,
     }),
     getRankedEntries(env, account.puuid, region),
   ]);
-  const matches = await getMatches(env, matchIds, region);
+  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region);
+  if (snapshot && !snapshot.matches) Object.assign(snapshot, { account, startTime, endTime, rankedEntries,
+    matches: compactMatches(matches, account.puuid), offset: matchIds.length, more: matchIds.length === MAX_STATS_MATCHES });
   const selectedMatches = champion ? matches.filter((match) => {
     const participant = participantFor(match, account.puuid);
     return participant && championInfo(catalog, participant.championId ?? participant.championName)?.id === champion.id;
   }) : matches;
   const stats = aggregateMatches(selectedMatches, account.puuid, days);
   const canonicalId = `${account.gameName ?? riotId.gameName}#${account.tagLine ?? riotId.tagLine}`;
-  const capped = matchIds.length === MAX_STATS_MATCHES;
+  const capped = snapshot ? snapshot.more : matchIds.length === MAX_STATS_MATCHES;
   const sampleNote = champion
     ? `\n${stats.games} ${champion.name} game${stats.games === 1 ? "" : "s"} in the ${matchIds.length} newest game${matchIds.length === 1 ? "" : "s"} returned for this period${mode ? " and mode" : ""}.${capped ? " Older champion games may not be included." : ""}`
     : "";
@@ -529,22 +559,26 @@ export async function buildStatsResponse(interaction, env) {
           }] : []),
         ],
         footer: {
-          text: `${region.label} • ${mode ? queueName(mode) : "All modes"} • America/New_York${capped ? ` • Capped at the ${MAX_STATS_MATCHES} newest games` : ""}`,
+          text: `${region.label} • ${mode ? queueName(mode) : "All modes"} • America/New_York${capped ? ` • Capped at the ${matchIds.length} newest games` : ""}`,
         },
       },
     ],
   });
 }
 
-export async function buildRecentResponse(interaction, env) {
+export async function buildRecentResponse(interaction, env, snapshot = null) {
   const riotId = parseRiotId(optionValue(interaction, "summoner", ""));
   const count = Math.max(1, Math.min(10, Number(optionValue(interaction, "count", 5))));
   const region = getRegion(interaction);
   const mode = getMode(interaction);
-  const account = await resolveAccount(env, riotId, region);
-  const matchIds = await getMatchIds(env, account.puuid, region, { count, queue: mode });
-  const matches = await getMatches(env, matchIds, region);
-  const stats = aggregateMatches(matches, account.puuid, 1);
+  const account = snapshot?.account ?? await resolveAccount(env, riotId, region);
+  const endTime = snapshot?.endTime ?? Math.floor(Date.now() / 1000);
+  const matchIds = snapshot?.matches ? snapshot.matches.map((match) => match.metadata.matchId) : await getMatchIds(env, account.puuid, region, { count, queue: mode, endTime });
+  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region);
+  if (snapshot && !snapshot.matches) Object.assign(snapshot, { account, endTime, matches: compactMatches(matches, account.puuid), offset: matchIds.length, more: matchIds.length === count });
+  const page = snapshot?.page ?? 0;
+  const allRows = aggregateMatches(matches, account.puuid, 1);
+  const stats = { ...allRows, rows: allRows.rows.slice(page * count, (page + 1) * count) };
   const canonicalId = `${account.gameName ?? riotId.gameName}#${account.tagLine ?? riotId.tagLine}`;
   const catalog = await getChampionCatalog();
 
@@ -552,7 +586,7 @@ export async function buildRecentResponse(interaction, env) {
 
   return message("", {
     embeds: stats.rows.length ? stats.rows.map((row, index) => ({
-      title: index === 0 ? `${canonicalId} — recent games` : `${canonicalId} — ${index + 1}/${stats.rows.length}`,
+      title: index === 0 ? `${canonicalId} — recent games${snapshot ? ` • page ${page + 1}` : ""}` : `${canonicalId} — ${page * count + index + 1}`,
       color: row.win ? 0x2ecc71 : 0xe05d6f,
       description: `**${row.champion} • ${row.win ? "WIN" : "LOSS"}**\n${row.queue} • ${formatDuration(row.duration)}\n${metricsSummary(row.metrics)}\n${formatEasternDate(row.timestamp)}`,
       ...championThumbnail(catalog, row.championId ?? row.champion),
@@ -628,7 +662,7 @@ function helpResponse() {
         color: 0x5383e8,
         title: "LeagueStats help",
         description:
-          "Look up any summoner with a Riot ID in `Game Name#TAG` format. NA is the default region.",
+          "Use any Riot ID in `Game Name#TAG` format, or save a default with `/profile set`. NA and all modes are the defaults. Add `private:true` to keep a lookup visible only to you.",
         fields: [
           {
             name: "Quick stats",
@@ -638,7 +672,7 @@ function helpResponse() {
           {
             name: "Commands",
             value:
-              "`/stats` — win rate, games/day, rank, KDA, CS/min; optional champion filter\n`/recent` — recent match list\n`/live` — current game status\n`/ping` — bot health",
+              "`/stats` — champion stats, period buttons and cached load-more\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
             inline: false,
           },
           {
@@ -649,7 +683,7 @@ function helpResponse() {
           },
           {
             name: "Monitor & data",
-            value: "Live games, completed results and Solo/Duo + Flex demotions are posted automatically. Choose a summoner suggestion or enter any Riot ID.\nChampion stats filter the newest 30 games for your period/mode; rank remains account-wide.\nARAM Mayhem results depend on Riot's API; unavailable games are not invented.\n[Source & setup](https://github.com/tarun-bandi/league-stats-discord-bot)",
+            value: "Card controls belong to the requester and expire after an hour. Load more scans older games in batches (up to 300); coverage is labeled. Rank remains account-wide.\nAdmins can add/pause/resume/archive NA trackers without erasing history. Existing live messages still finish in completed-only mode.\nARAM Mayhem depends on Riot's API; unavailable games are not invented.\n[Source & setup](https://github.com/tarun-bandi/league-stats-discord-bot)",
             inline: false,
           },
         ],
@@ -676,13 +710,18 @@ async function runDeferredCommand(interaction, env) {
     let payload;
     switch (interaction.data?.name) {
       case "stats":
-        payload = await buildStatsResponse(interaction, env);
-        break;
       case "recent":
-        payload = await buildRecentResponse(interaction, env);
+      case "session":
+        payload = await createLookup(interaction, env);
         break;
       case "live":
         payload = await buildLiveResponse(interaction, env);
+        break;
+      case "profile":
+        payload = await profileCommand(interaction, env);
+        break;
+      case "track":
+        payload = featureMessage(await trackingCommand(interaction, env));
         break;
       default:
         payload = message("Unknown command.");
@@ -712,12 +751,25 @@ async function runDeferredCommand(interaction, env) {
   }
 }
 
+async function runComponent(interaction, env) {
+  try { await editOriginalResponse(interaction, await updateLookup(interaction, env)); }
+  catch (error) {
+    // A failed click must not replace a good public card with an error.
+    const content = error instanceof UserFacingError ? error.message : "This card could not be updated. Try again shortly.";
+    const response = await fetch(`${DISCORD_API}/webhooks/${interaction.application_id}/${interaction.token}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(message(content, { ephemeral: true })),
+    });
+    if (!response.ok) console.error("Could not deliver private component error");
+  }
+}
+
 export default {
   async scheduled(controller, env) {
     try {
       await runLeagueMonitor(env, {
         detectionTimestamp: controller.scheduledTime || Date.now(),
       });
+      if (monitorEnabled(env) && env.MONITOR_DB && new Date(controller.scheduledTime || Date.now()).getUTCMinutes() === 0) await purgeExpiredRecords(env.MONITOR_DB);
     } catch (error) {
       console.error(
         "League Game Monitor failed",
@@ -735,7 +787,9 @@ export default {
       }
       if (url.pathname === "/monitor/status") {
         try {
-          return json(await monitorStatus(env));
+          const status = await monitorStatus(env);
+          const health = await readRecord(env.MONITOR_DB, "health:riot");
+          return json({ ...status, credentialHealth: { status: health?.status ?? "unknown", changedAt: health?.changedAt ?? null, notificationPending: Boolean(health?.pending?.length), deliveryError: Boolean(health?.deliveryError) } });
         } catch {
           return json(
             {
@@ -785,6 +839,18 @@ export default {
       return autocompleteResponse(interaction, env);
     }
 
+    if ([3, 5].includes(interaction.type)) {
+      try {
+        const { view, action } = await resolveView(interaction, env);
+        if (action === "champion" && interaction.type === 3) return json(championModal(view));
+        if (interaction.type === 5 && action !== "choose") throw new UserFacingError("Unknown form.");
+        context.waitUntil(runComponent(interaction, env));
+        return json({ type: 6 });
+      } catch (error) {
+        return immediateMessage(error instanceof UserFacingError ? error.message : "This card is temporarily unavailable.", { ephemeral: true });
+      }
+    }
+
     if (interaction.type !== 2) {
       return immediateMessage("Unsupported interaction.", { ephemeral: true });
     }
@@ -797,9 +863,19 @@ export default {
       return json({ type: 4, data: helpResponse() });
     }
 
-    if (["stats", "recent", "live"].includes(interaction.data?.name)) {
-      context.waitUntil(runDeferredCommand(interaction, env));
-      return deferredMessage();
+    if (["stats", "recent", "live", "session", "profile", "track"].includes(interaction.data?.name)) {
+      try {
+        const administrative = ["profile", "track"].includes(interaction.data.name);
+        if (interaction.data.name === "track") assertMonitorAdmin(interaction, env);
+        // Read preferences before acknowledging so a private default can never
+        // accidentally be posted publicly. Storage failure is fail-closed.
+        const effective = administrative ? interaction : withDefaults(interaction, await readProfile(interaction, env));
+        if (!administrative && !optionsObject(effective).summoner) return immediateMessage("Choose a summoner or save one with `/profile set summoner:...`.", { ephemeral: true });
+        context.waitUntil(runDeferredCommand(effective, env));
+        return deferredMessage(administrative || Boolean(optionsObject(effective).private));
+      } catch (error) {
+        return immediateMessage(error instanceof UserFacingError ? error.message : "Your settings could not be loaded. Nothing was posted publicly; try again shortly.", { ephemeral: true });
+      }
     }
 
     return immediateMessage("Unknown command. Try `/help`.", {

@@ -46,5 +46,12 @@ export function observeRanks(tracker, entries, detectionIso) {
   }
   tracker.rank_snapshot = current;
   tracker.rank_checked_at = detectionIso;
+  tracker.rank_history ??= [];
+  const last = tracker.rank_history.at(-1);
+  // Keep an hourly observation plus changes; never manufacture a midnight LP.
+  if (!last || last.at.slice(0, 13) !== detectionIso.slice(0, 13) || JSON.stringify(last.entries) !== JSON.stringify(current)) {
+    tracker.rank_history.push({ at: detectionIso, entries: current });
+    tracker.rank_history = tracker.rank_history.filter((point) => Date.parse(detectionIso) - Date.parse(point.at) < 32 * 86400_000).slice(-500);
+  }
   return alerts;
 }

@@ -9,7 +9,7 @@
     "deploy": "wrangler deploy",
     "register:commands": "node scripts/register-commands.mjs",
     "smoke:alert": "node scripts/smoke-alert.mjs",
-    "test": "node --test"
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

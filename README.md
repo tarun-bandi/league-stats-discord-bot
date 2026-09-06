@@ -7,10 +7,10 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 
 ## Features
 
-- `/help`, `/stats`, `/recent`, `/live`, and `/ping`
+- `/help`, `/stats`, `/recent`, `/session`, `/live`, `/profile`, `/track`, and `/ping`
 - Arbitrary Riot IDs and supported League regions for interactive commands
 - Monitored-account autocomplete for the `summoner` option on `/stats`, `/recent`, and `/live`
-- One-minute Cloudflare Cron Trigger for three configured NA accounts
+- One-minute Cloudflare Cron Trigger with an admin-managed NA roster
 - Riot Match-v5 and Spectator-v5 monitoring
 - D1-backed durable cursors, live-game correlation, and Discord message IDs
 - One Discord alert per game, authored by the LeagueStats bot and edited when the game completes
@@ -21,6 +21,10 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 - Damage, vision, gold, placement and pentakill details where Riot supplies them
 - Champion portraits on recent-game cards, live/completed alerts, live responses and stats
 - Automatic slash-command registration after a deployment
+- Per-user, per-server account/region/mode/privacy defaults
+- Owner-only interactive cards, recent pagination and cached history up to 300 games
+- Session summaries with time played and observed (not reconstructed) LP changes
+- One-time credential-failure/recovery notifications to the configured owner
 
 ## Try it
 
@@ -30,16 +34,20 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 /stats summoner:HelloThere#9494 champion:Zed days:30
 /recent summoner:Knaye East#YEEZY mode:ARAM Mayhem
 /live summoner:HelloThere#9494
+/profile set summoner:TIXBS Chaos#NA1 mode:Ranked Solo/Duo
+/stats champion:Xerath private:true
+/session
 ```
 
 Select `summoner` to see the three monitored accounts. Any valid Riot ID still
 works. `mode` defaults to all modes; stats cover seven days by default and at most
-30 matches. Add `champion` to get that champion's win rate, KDA, CS/min, games/day
+30 matches initially. Use **Load 30 more** to scan older games in cached batches,
+up to 300 per card. Add `champion` to get that champion's win rate, KDA, CS/min, games/day
 and impact stats, with its portrait. Champion names are suggested as you type;
 punctuation/case and canonical aliases such as Cho'Gath/Chogath and
 Wukong/MonkeyKing are accepted. It combines with `days`, `mode` and `region`.
-Champion filtering applies **within the newest 30 games returned for the chosen
-period and mode**, not the newest 30 games on that champion. The response labels
+Champion filtering applies **within the games scanned for the chosen
+period and mode**, not the newest games on that champion. The response labels
 the sample; older champion games may be excluded. Rank stays account-wide.
 Omit `champion` for the existing overall stats. Riot may not expose completed ARAM Mayhem matches. See the
 [payload and mode guide](docs/payload.md) for exactly what we can show.
@@ -53,6 +61,7 @@ Omit `champion` for the existing overall stats. Riot may not expose completed AR
 - `MONITOR_ENABLED` — explicit monitor kill switch; only `true`, `1`, `yes`, or `on` enables checks
 - `MONITOR_DB` — D1 binding containing the authoritative monitor state
 - `DISCORD_APPLICATION_ID` — public bot application ID, enables automatic command reconciliation
+- `DISCORD_GUILD_ID` — public alerts-server ID; restricts admin tracking controls
 
 The production Cron Trigger is `* * * * *`. The monitor does not access D1,
 Riot, or Discord while `MONITOR_ENABLED` is false. When enabled, it refuses to
@@ -70,7 +79,7 @@ Put local-only secrets in `.dev.vars`; that file is ignored by Git.
 
 ## Deployment
 
-Apply `migrations/0001_monitor_state.sql`, seed the `league-game-monitor` row
+Apply the additive migrations in `migrations/` (including `0002_bot_records.sql`), seed the `league-game-monitor` row
 from a validated state backup, configure the five secrets, and deploy with
 Wrangler. Do not enable the Cron Trigger until the state row is present.
 
@@ -128,14 +137,53 @@ previously saved Riot match before changing it. Existing cursors, rank baselines
 and Discord message records are retained. If identity cannot be verified, the
 check fails without saving state; do not reset history to work around it.
 
-The current monitor intentionally validates **three NA trackers**. Their live
-configuration and cursors are in D1, not a YAML file. Autocomplete reads that same
-state. To change the roster, pause monitoring, back up D1, update only the target
-tracker (including its own baseline/cursors), validate the state, then resume.
-Never replace the entire state from an old backup or discard reported records.
-For a different tracker count, update the validation and tests and reassess Riot
-rate limits/Worker subrequests before deploying. The slash commands can query
-other accounts without enrolling them in automatic alerts.
+The original three-track state remains valid without conversion. Admin roster
+commands upgrade its validation version in place; no existing records are erased.
+Use `/track add/remove/list/pause/resume` in the configured alerts server with
+Manage Server or Administrator permission. Up to ten accounts may be active;
+paused/archived records remain available for deduplication and grouped-message edits.
+Add/resume establish a fresh completed-match cutoff and do not replay older games.
+The one-minute scheduler rotates unfinished work when its request budget is used;
+larger rosters or backlogs may take multiple ticks. Each tracker retains its own
+cursor. Existing live alerts finish even after pause/removal or an alert-mode change.
+
+`/track alerts mode:Completed only` suppresses new live announcements but retains
+completion and demotion alerts. `Live + completed` restores the original policy.
+The slash commands can query other regions/accounts without enrolling them.
+
+## Personal defaults and interactive cards
+
+Use `/profile set` to save your summoner, region, mode, private-response preference
+and IANA session timezone. `/profile show` and `/profile clear` are private.
+Defaults are scoped to the invoking Discord user and server, not shared by friends.
+Explicit lookup options win, including `private:false` to share a result.
+There is no account-ownership claim: this is a convenience preference for public stats.
+
+Stats cards provide 7/30-day switches, a champion-name form, recent games,
+refresh and load-more. Recent cards have previous/next pages. Only the requester
+can operate a card, and controls expire after one hour. Expiring cached views keep
+only the requested participant's public stat fields; hourly cleanup removes expired
+views. No interaction tokens or API credentials are stored in these records.
+
+`/session` covers games started since local midnight (America/New_York by default).
+It shows W/L, time played, most wins by champion, KDA and CS/min. LP change is only
+shown from a same-day tracked rank observation, with its actual observation time.
+It is not an estimate of an unobserved midnight rank. Rank observations are bounded
+to the most recent 500 points/32 days; pauses and season resets may leave no valid baseline.
+
+## Credential health
+
+A confirmed Riot authentication failure queues one private failure notice, then
+one recovery notice once authenticated requests succeed again. Repeated failures
+do not create new events. Failed DM delivery stays queued, uses a stable Discord
+nonce on retry, and appears in `/monitor/status` without exposing credentials or
+recipient IDs. Discord nonce deduplication has a limited window; it is not a
+permanent exactly-once guarantee across a crash after delivery but before storage.
+The default recipient is the configured server's owner; admins can select a
+different recipient with `/track notifications owner:<user>`. Allow bot DMs for
+that recipient. No failure/recovery tests should invalidate a working production key.
+
+See [QoL delivery acceptance](docs/qol-delivery.md) for verification status.
 
 [Backlog coverage](docs/backlog.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 

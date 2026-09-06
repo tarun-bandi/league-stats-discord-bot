@@ -4,7 +4,8 @@
   "main": "src/index.js",
   "compatibility_date": "2026-08-23",
   "vars": {
-    "DISCORD_APPLICATION_ID": "777218985527083008"
+    "DISCORD_APPLICATION_ID": "777218985527083008",
+    "DISCORD_GUILD_ID": "767773215409307648"
   },
   "observability": {
     "enabled": true

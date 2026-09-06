@@ -15,7 +15,7 @@ test("summoner options autocomplete the monitored accounts", () => {
     ["stats", "recent", "live"].includes(name),
   )) {
     const option = command.options.find(({ name }) => name === "summoner");
-    assert.equal(option.required, true);
+    assert.equal(option.required, false);
     assert.equal(option.autocomplete, true);
     assert.equal(option.choices, undefined);
   }

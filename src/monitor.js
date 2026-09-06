@@ -4,6 +4,7 @@ import { observeRanks, rankLabel, RANK_POLL_MS } from "./ranks.js";
 import { syncDiscordApplication } from "./application.js";
 import { getChampionCatalog, championInfo } from "./champions.js";
 import { riotKeyFingerprint } from "./riot-key.js";
+import { reportCredentialHealth, confirmCredentialFailure } from "./health.js";
 
 const STATE_KEY = "league-game-monitor";
 const DISCORD_API = "https://discord.com/api/v10";
@@ -36,7 +37,7 @@ function parseRiotId(value) {
   };
 }
 
-function trackerEntries(state) {
+export function trackerEntries(state) {
   return [
     { stateKey: "na:hellothere#9494", tracker: state },
     ...Object.entries(state.additional_summoners ?? {}).map(
@@ -73,12 +74,14 @@ export function validateMonitorState(state) {
   }
 
   const entries = trackerEntries(state);
-  if (entries.length !== 3) {
+  if (state.roster_version !== 2 && entries.length !== 3) {
     throw new Error(`Expected 3 monitor trackers, found ${entries.length}`);
   }
   for (const { stateKey, tracker } of entries) {
     validateTracker(tracker, stateKey);
+    if (tracker.monitor_paused !== undefined && typeof tracker.monitor_paused !== "boolean") throw new Error("Invalid tracker pause flag");
   }
+  if (entries.filter(({ tracker }) => !tracker.removed_at && !tracker.monitor_paused).length > 10) throw new Error("At most 10 accounts may be actively tracked");
   return state;
 }
 
@@ -155,9 +158,11 @@ async function riotJson(
   { allowNotFound = false, allowInvalidIdentifier = false } = {},
 ) {
   if (!env.RIOT_API_KEY) throw new Error("RIOT_API_KEY is not configured");
+  if (env.riotBudget && env.riotBudget.remaining-- <= 0) throw Object.assign(new Error("Monitor request budget reached"), { budgetExceeded: true });
   const response = await fetch(url, {
     headers: { "X-Riot-Token": env.RIOT_API_KEY },
   });
+  if (env.riotBudget && (response.ok || response.status === 404)) env.riotBudget.successes++;
   if (allowNotFound && response.status === 404) return null;
   if (allowInvalidIdentifier && [400, 404].includes(response.status)) return null;
   if (!response.ok) {
@@ -358,7 +363,7 @@ export async function reconcilePendingLiveGames(
   matchDetailImpl = matchDetail,
 ) {
   const reconciled = [];
-  for (const [recordKey, record] of pendingLiveRecords(tracker)) {
+  for (const [recordKey, record] of pendingLiveRecords(tracker).slice(0, 5)) {
     const gameId = normalizedGameId(record.riot_game_id ?? record.live_game_id);
     if (!gameId) continue;
     let match;
@@ -432,7 +437,7 @@ function updateCompletedCursor(tracker, game) {
 }
 
 async function completedUpdates(env, tracker, detectionIso) {
-  const targetMs = Date.parse(tracker.newest_completed_match?.started_at ?? "");
+  const targetMs = Date.parse(tracker.newest_completed_match?.started_at ?? tracker.monitor_started_at ?? "");
   const startTime = tracker.riot_newest_completed_match_id
     ? undefined
     : Number.isFinite(targetMs)
@@ -445,7 +450,11 @@ async function completedUpdates(env, tracker, detectionIso) {
   let cursor = tracker.riot_newest_completed_match_id;
   let cursorIndex = cursor ? ids.indexOf(cursor) : -1;
 
-  if (!cursor) {
+  if (!cursor && tracker.monitor_started_at) {
+    // A newly enrolled account may have no match history yet. Its first future
+    // match is an alert, not another initialization baseline.
+    cursorIndex = ids.length;
+  } else if (!cursor) {
     const details = await matchDetails(env, ids, detailCache);
     cursorIndex = details.findIndex((match) => matchesSavedCursor(match, tracker));
     if (cursorIndex === -1) {
@@ -464,7 +473,8 @@ async function completedUpdates(env, tracker, detectionIso) {
     );
   }
 
-  const newIds = ids.slice(0, cursorIndex);
+  // Drain an older backlog chronologically in bounded batches, never jump the cursor.
+  const newIds = ids.slice(Math.max(0, cursorIndex - 5), cursorIndex);
   if (!newIds.length) return [];
   const details = await matchDetails(env, newIds, detailCache);
   const updates = details
@@ -721,7 +731,7 @@ function recordsForMessage(state, messageId) {
   return records;
 }
 
-async function acquireLease(db, nowMs, owner) {
+export async function acquireLease(db, nowMs, owner) {
   const result = await db
     .prepare(
       "UPDATE monitor_state SET lease_until = ?1, lease_owner = ?2 WHERE state_key = ?3 AND lease_until < ?4",
@@ -731,7 +741,7 @@ async function acquireLease(db, nowMs, owner) {
   return Number(result.meta?.changes ?? 0) === 1;
 }
 
-async function releaseLease(db, owner) {
+export async function releaseLease(db, owner) {
   await db
     .prepare(
       "UPDATE monitor_state SET lease_until = 0, lease_owner = NULL WHERE state_key = ?1 AND lease_owner = ?2",
@@ -740,7 +750,7 @@ async function releaseLease(db, owner) {
     .run();
 }
 
-async function readState(db) {
+export async function readState(db) {
   const row = await db
     .prepare("SELECT state_json FROM monitor_state WHERE state_key = ?1")
     .bind(STATE_KEY)
@@ -755,7 +765,7 @@ async function readState(db) {
   return validateMonitorState(state);
 }
 
-async function saveState(db, owner, state, detectionIso) {
+export async function saveState(db, owner, state, detectionIso) {
   const result = await db
     .prepare(
       "UPDATE monitor_state SET state_json = ?1, lease_until = 0, lease_owner = NULL, updated_at = ?2 WHERE state_key = ?3 AND lease_owner = ?4",
@@ -810,7 +820,9 @@ export async function monitorStatus(env) {
       (total, { tracker }) => total + pendingLiveRecords(tracker).length,
       0,
     ),
-    summoners: trackerEntries(state).map(({ tracker }) => tracker.summoner.riot_id),
+    summoners: trackerEntries(state).filter(({ tracker }) => !tracker.removed_at).map(({ tracker }) => tracker.summoner.riot_id),
+    roster: trackerEntries(state).map(({ tracker }) => ({ summoner: tracker.summoner.riot_id, paused: Boolean(tracker.monitor_paused), archived: Boolean(tracker.removed_at) })),
+    alertMode: state.alert_mode ?? "all",
     rankMonitoring: {
       queues: ["Ranked Solo/Duo", "Ranked Flex"],
       baselineReady: trackerEntries(state).every(({ tracker }) => Boolean(tracker.rank_checked_at)),
@@ -822,6 +834,39 @@ export async function monitorStatus(env) {
   };
 }
 
+async function observeTracker(env, tracker, stateKey, detectionMs, names, keyFingerprint, keyChanged, alertMode) {
+  const detectionIso = new Date(detectionMs).toISOString();
+  const newAlerts = [];
+  const patchTargets = new Map();
+  await resolveTrackedAccount(env, tracker, detectionMs, { force: keyChanged || tracker.riot_key_fingerprint !== keyFingerprint });
+  tracker.riot_key_fingerprint = keyFingerprint;
+  const addPatch = (game) => {
+    if (game.patch_message_id) patchTargets.set(String(game.patch_message_id), { messageId: String(game.patch_message_id), channelId: game.patch_channel_id });
+  };
+  for (const game of await reconcilePendingLiveGames(env, tracker, detectionIso)) {
+    game.record.champion_icon_url = championInfo(names, game.record.champion_id ?? game.record.champion)?.icon ?? game.record.champion_icon_url;
+    addPatch(game);
+  }
+  if (tracker.monitor_paused || tracker.removed_at) return { newAlerts, patchTargets };
+  const completed = await completedUpdates(env, tracker, detectionIso);
+  for (const game of completed) {
+    if (game.record) game.record.champion_icon_url = championInfo(names, game.champion_id ?? game.champion)?.icon ?? game.record.champion_icon_url;
+    if (game.is_new_alert) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: game.record });
+    addPatch(game);
+  }
+  const live = await activeGame(env, tracker, detectionIso, names);
+  tracker.newest_live_game_id = live?.live_game_id ?? null;
+  const newLive = alertMode === "completed" ? null : addLiveUpdate(tracker, live);
+  if (newLive) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: newLive.record });
+  const lastRankMs = Date.parse(tracker.rank_checked_at ?? "");
+  if (!Number.isFinite(lastRankMs) || detectionMs - lastRankMs >= RANK_POLL_MS || completed.some((game) => [420, 440].includes(game.queue_id))) {
+    const ranked = await riotJson(env, `https://${NA_REGION.platform}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(tracker.summoner.puuid)}`);
+    for (const record of observeRanks(tracker, ranked, detectionIso)) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record });
+  }
+  tracker.last_check_at = detectionIso;
+  return { newAlerts, patchTargets };
+}
+
 export async function runLeagueMonitor(env, options = {}) {
   if (!monitorEnabled(env)) return { status: "disabled" };
   if (!env.MONITOR_DB) throw new Error("MONITOR_DB is not configured");
@@ -829,6 +874,7 @@ export async function runLeagueMonitor(env, options = {}) {
   if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_ALERT_CHANNEL_ID) {
     throw new Error("Discord bot transport is not configured");
   }
+  env = { ...env, riotBudget: { remaining: 18, successes: 0 } };
 
   const detectionMs = Number(options.detectionTimestamp ?? Date.now());
   const owner = crypto.randomUUID();
@@ -836,8 +882,9 @@ export async function runLeagueMonitor(env, options = {}) {
     return { status: "busy" };
   }
 
+  let previous;
   try {
-    const previous = await readState(env.MONITOR_DB);
+    previous = await readState(env.MONITOR_DB);
     const state = structuredClone(previous);
     const keyFingerprint = await riotKeyFingerprint(env.RIOT_API_KEY);
     const keyChanged = state.riot_key_fingerprint !== keyFingerprint;
@@ -846,58 +893,26 @@ export async function runLeagueMonitor(env, options = {}) {
     const names = await getChampionCatalog();
     const newAlerts = [];
     const patchTargets = new Map();
-
-    for (const { stateKey, tracker } of trackerEntries(state)) {
-      await resolveTrackedAccount(env, tracker, detectionMs, { force: keyChanged });
-      const reconciled = await reconcilePendingLiveGames(
-        env,
-        tracker,
-        detectionIso,
-      );
-      for (const game of reconciled) {
-        game.record.champion_icon_url = championInfo(names, game.record.champion_id ?? game.record.champion)?.icon ?? game.record.champion_icon_url;
-        if (game.patch_message_id) {
-          patchTargets.set(String(game.patch_message_id), {
-            messageId: String(game.patch_message_id),
-            channelId: game.patch_channel_id,
-          });
-        }
-      }
-      const completed = await completedUpdates(env, tracker, detectionIso);
-      for (const game of completed) {
-        if (game.record) game.record.champion_icon_url = championInfo(names, game.champion_id ?? game.champion)?.icon ?? game.record.champion_icon_url;
-        if (game.is_new_alert) {
-          newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: game.record });
-        }
-        if (game.patch_message_id) {
-          patchTargets.set(String(game.patch_message_id), {
-            messageId: String(game.patch_message_id),
-            channelId: game.patch_channel_id,
-          });
-        }
-      }
-
-      const live = await activeGame(env, tracker, detectionIso, names);
-      const newLive = addLiveUpdate(tracker, live);
-      if (newLive) {
-        newAlerts.push({
-          stateKey,
-          riotId: tracker.summoner.riot_id,
-          record: newLive.record,
-        });
-      }
-      const lastRankMs = Date.parse(tracker.rank_checked_at ?? "");
-      if (!Number.isFinite(lastRankMs) || detectionMs - lastRankMs >= RANK_POLL_MS ||
-          completed.some((game) => [420, 440].includes(game.queue_id))) {
-        const ranked = await riotJson(env,
-          `https://${NA_REGION.platform}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(tracker.summoner.puuid)}`);
-        for (const record of observeRanks(tracker, ranked, detectionIso)) {
-          newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record });
-        }
-      }
-    }
-
     await syncDiscordApplication(env, state);
+    const entries = trackerEntries(state).filter(({ tracker }) => !tracker.monitor_paused && !tracker.removed_at || pendingLiveRecords(tracker).length);
+    const start = (state.monitor_next_index ?? 0) % Math.max(1, entries.length);
+    for (let step = 0; step < entries.length; step++) {
+      const index = (start + step) % entries.length;
+      const { stateKey, tracker: saved } = entries[index];
+      const tracker = structuredClone(saved);
+      // The legacy top-level tracker shares an object with the roster. Never
+      // replace its additional_summoners map while committing its own fields.
+      delete tracker.additional_summoners;
+      state.monitor_next_index = index;
+      let observed;
+      try { observed = await observeTracker(env, tracker, stateKey, detectionMs, names, keyFingerprint, keyChanged, state.alert_mode); }
+      catch (error) { if (error.budgetExceeded) break; throw error; }
+      if (newAlerts.length + observed.newAlerts.length > 10) break;
+      Object.assign(saved, tracker);
+      newAlerts.push(...observed.newAlerts);
+      for (const [id, target] of observed.patchTargets) patchTargets.set(id, target);
+      state.monitor_next_index = (index + 1) % entries.length;
+    }
     await commitMonitorChanges(env, {
       state,
       owner,
@@ -905,6 +920,7 @@ export async function runLeagueMonitor(env, options = {}) {
       newAlerts,
       patchTargets,
     });
+    if (env.DISCORD_GUILD_ID && env.riotBudget.successes) await reportCredentialHealth(env, "ok", state, detectionMs);
     return {
       status: "ok",
       newAlerts: newAlerts.length,
@@ -913,6 +929,11 @@ export async function runLeagueMonitor(env, options = {}) {
     };
   } catch (error) {
     await releaseLease(env.MONITOR_DB, owner).catch(() => {});
+    if (env.DISCORD_GUILD_ID && previous && [401, 403].includes(error.httpStatus)) {
+      try {
+        if (await confirmCredentialFailure(env, previous)) await reportCredentialHealth(env, "invalid", previous, detectionMs);
+      } catch { console.error("Credential health confirmation could not complete; match state is preserved."); }
+    }
     throw error;
   }
 }

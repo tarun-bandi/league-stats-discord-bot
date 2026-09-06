@@ -28,7 +28,7 @@ const riotIdOption = {
   name: "summoner",
   description: "Riot ID; monitored accounts are suggested as you type",
   type: 3,
-  required: true,
+  required: false,
   autocomplete: true,
 };
 
@@ -44,6 +44,10 @@ const modeOption = {
   name: "mode", description: "Filter by game mode (defaults to all modes)",
   type: 4, required: false, choices: MODE_CHOICES,
 };
+
+const privateOption = { name: "private", description: "Show the response only to you", type: 5, required: false };
+const requiredSummoner = { ...riotIdOption, required: true };
+const trackerCommand = (name, description) => ({ name, description, type: 1, options: [requiredSummoner] });
 
 export const COMMANDS = [
   {
@@ -78,6 +82,7 @@ export const COMMANDS = [
         min_length: 1,
         max_length: 100,
       },
+      privateOption,
     ],
   },
   {
@@ -97,6 +102,7 @@ export const COMMANDS = [
       },
       regionOption,
       modeOption,
+      privateOption,
     ],
   },
   {
@@ -104,7 +110,40 @@ export const COMMANDS = [
     type: 1,
     description: "Check whether a summoner is currently in a League game",
     dm_permission: false,
-    options: [riotIdOption, regionOption],
+    options: [riotIdOption, regionOption, privateOption],
+  },
+  {
+    name: "session", type: 1, description: "Today's wins, losses, play time, best champion and observed LP change",
+    dm_permission: false, options: [riotIdOption, regionOption, modeOption, privateOption],
+  },
+  {
+    name: "profile", type: 1, description: "Save your personal LeagueStats defaults", dm_permission: false,
+    options: [
+      { name: "set", description: "Save or update your defaults in this server", type: 1, options: [
+        riotIdOption, regionOption, modeOption, privateOption,
+        { name: "timezone", description: "IANA time zone, e.g. America/New_York or Europe/London", type: 3, max_length: 64 },
+      ] },
+      { name: "show", description: "Show your saved defaults privately", type: 1 },
+      { name: "clear", description: "Clear your saved defaults in this server", type: 1 },
+    ],
+  },
+  {
+    name: "track", type: 1, description: "Admin controls for the LeagueStats monitor", dm_permission: false,
+    default_member_permissions: "32",
+    options: [
+      trackerCommand("add", "Track an NA account from now, without historical alerts"),
+      trackerCommand("remove", "Archive a tracker while preserving its history"),
+      trackerCommand("pause", "Pause new alerts; existing live alerts still finish"),
+      trackerCommand("resume", "Resume from now without replaying paused games"),
+      { name: "list", description: "List active, paused and archived trackers", type: 1 },
+      { name: "alerts", description: "Choose channel alert verbosity", type: 1, options: [
+        { name: "mode", description: "Live and completed, or completed only", type: 3, required: true,
+          choices: [{ name: "Live + completed", value: "all" }, { name: "Completed only", value: "completed" }] },
+      ] },
+      { name: "notifications", description: "Choose who receives credential failure/recovery DMs", type: 1, options: [
+        { name: "owner", description: "Notification recipient; defaults to the server owner", type: 6, required: true },
+      ] },
+    ],
   },
   {
     name: "ping",
