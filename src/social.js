@@ -1,3 +1,5 @@
+import { RiotRateLimitError } from "./errors.js";
+import { opggStats, sourceNote } from "./opgg.js";
 import { aggregateMatches, parseRiotId, resolveAccount, getRegion, getMode, loadMoreMatches, UserFacingError } from "./index.js";
 import { optionsObject, userId } from "./preferences.js";
 import { featureMessage } from "./features.js";
@@ -16,13 +18,22 @@ const integer = (value, fallback, max) => {
 };
 
 export async function playerStats(query, env, window, count) {
+  try { return await riotPlayerStats(query, env, window, count); }
+  catch (error) {
+    if (!(error instanceof RiotRateLimitError)) throw error;
+    const { rows, ...fallback } = await opggStats(query, env, window, count);
+    return fallback;
+  }
+}
+
+async function riotPlayerStats(query, env, window, count) {
   const interaction = asInteraction(query);
   const account = await resolveAccount(env, parseRiotId(query.summoner), getRegion(interaction));
   const snapshot = { startTime: window.startTime, endTime: window.endTime, account, matches: [], offset: 0 };
   await loadMoreMatches(interaction, env, snapshot, count);
   const { rows, ...stats } = aggregateMatches(snapshot.matches, account.puuid, query.days);
   return { name: safeName(`${account.gameName}#${account.tagLine}`), puuid: account.puuid, ...stats,
-    hours: rows.reduce((sum, row) => sum + row.duration, 0) / 3600, capped: snapshot.more };
+    hours: rows.reduce((sum, row) => sum + row.duration, 0) / 3600, capped: snapshot.more, accountId: `${query.region ?? "na"}:${parseRiotId(query.summoner).display.toLowerCase()}` };
 }
 
 export function rankPlayers(players, metric, minimum) {
@@ -33,7 +44,17 @@ export function rankPlayers(players, metric, minimum) {
 const format = (metric, value) => value == null ? "N/A" : `${Number(value).toFixed(metric === "games" ? 0 : metric === "winRate" ? 1 : 2)}${metric === "winRate" ? "%" : metric === "hours" ? "h" : ""}`;
 const context = (view) => `Last ${view.query.days} days • ${view.query.mode ? queueName(view.query.mode) : "All modes"} • Through <t:${view.endTime}:f>`;
 
-const lineFields = (name, lines) => Array.from({ length: Math.ceil(lines.length / 5) }, (_, i) => ({ name: i ? `${name} (continued)` : name, value: lines.slice(i * 5, i * 5 + 5).join("\n") }));
+const lineFields = (name, lines) => {
+  const fields = [];
+  for (const line of lines) {
+    let field = fields.at(-1);
+    if (!field || field.value.length + line.length + 1 > 1024) {
+      field = { name: fields.length ? `${name} (continued)` : name, value: "" }; fields.push(field);
+    }
+    field.value += `${field.value ? "\n" : ""}${line}`;
+  }
+  return fields;
+};
 
 export function renderLeaderboard(view) {
   const metric = view.query.metric;
@@ -45,9 +66,10 @@ export function renderLeaderboard(view) {
     description: `${context(view)}\nNA • ${view.players.length}/${view.roster.length} players loaded • Minimum ${view.query.min_games} sampled games\n${pending ? "Some player lookups failed or timed out. Retry to complete the standings." : "Standings cover the active roster captured when this card was created."}\n${modeNote(view.query.mode) || ""}`,
     fields: [
       ...lineFields(pending ? "Provisional standings" : "Standings", ranked.length ? ranked.map((p) => `**${p.position}. ${p.name}** — ${format(metric, p[metric])} • ${p.wins}W–${p.losses}L (${p.games}g${p.capped ? ", capped" : ""})`) : ["No qualifying players loaded."]),
+      ...lineFields("Data sources", view.players.filter((p) => p.source === "opgg").map((p) => `${p.name}: ${sourceNote(p)}`)),
       ...lineFields("Could not load", (view.failures ?? []).map((failure) => `${safeName(failure.summoner)}: ${failure.error}`)),
       ...lineFields("Not qualified", excluded.map((p) => `${p.name}: ${p.games} games${!Number.isFinite(p[metric]) ? "; metric unavailable" : ""}`)),
-    ], footer: { text: "Newest 30 games per player in this window • Capped samples can omit older games • Ties share a rank" },
+    ], footer: { text: "Riot: newest 30 games; OP.GG: limited public sample. Sources can differ in coverage; ties share a rank." },
   }]);
   payload.components = pending ? [{ type: 1, components: [{ type: 2, style: 1, label: "Retry missing players", custom_id: `social:${view.id}:next` }] }] : [];
   return payload;
@@ -64,14 +86,15 @@ export async function createSocial(interaction, env, playerService) {
     // Two players × 15 details plus account/ID cache operations stay under 50 subrequests.
     const players = [];
     for (const summoner of [query.summoner, query.opponent]) players.push(await playerStats({ ...query, summoner }, env, window, 15));
-    if (players[0].puuid === players[1].puuid) throw new UserFacingError("Choose two different accounts to compare.");
+    if ((players[0].puuid && players[0].puuid === players[1].puuid) || players[0].accountId === players[1].accountId) throw new UserFacingError("Choose two different accounts to compare.");
     return featureMessage("", [{ title: "Player comparison", description: `${context({ query, endTime })}\n${region.label} • Same period and mode for both players.\n${modeNote(query.mode) || ""}`,
       fields: players.map((p) => ({ name: p.name, inline: true, value: p.games ? [
         `**${p.wins}W–${p.losses}L • ${format("winRate", p.winRate)}**`, `${p.games} sampled games${p.capped ? " (capped)" : ""} • ${format("hours", p.hours)} played`,
         `${format("kda", p.kda)} KDA`, `${format("csPerMinute", p.csPerMinute)} CS/min`,
+        sourceNote(p),
         `${format("damage", p.averageDamagePerMinute)} damage/min`, `${format("vision", p.averageVision)} avg vision`,
-      ].join("\n") : "No completed games returned in this period and mode." })),
-      footer: { text: "Newest 15 games per player • Older games may be omitted • Descriptive stats, not a skill rating" },
+      ].filter(Boolean).join("\n") : `No matching games in the available sample. ${sourceNote(p)}` })),
+      footer: { text: "Up to 15 games per player; OP.GG may expose fewer. N/A means unavailable, not zero. Samples may differ in coverage." },
     }]);
   }
   if (!env.DISCORD_GUILD_ID || interaction.guild_id !== env.DISCORD_GUILD_ID) throw new UserFacingError("Use /leaderboard in the configured tracking server.");
