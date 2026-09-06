@@ -673,7 +673,7 @@ function helpResponse() {
           {
             name: "Commands",
             value:
-              "`/stats` — champion stats, period buttons and cached load-more\n`/leaderboard` — rank active tracked players; load each player on the card\n`/compare` — two players, same period and mode\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
+              "`/stats` — champion stats, period buttons and cached load-more\n`/leaderboard` — automatically rank up to 10 active tracked players\n`/compare` — two players, same period and mode\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
             inline: false,
           },
           {
@@ -706,7 +706,7 @@ async function editOriginalResponse(interaction, payload) {
   }
 }
 
-async function runDeferredCommand(interaction, env) {
+async function runDeferredCommand(interaction, env, context) {
   try {
     let payload;
     switch (interaction.data?.name) {
@@ -717,7 +717,7 @@ async function runDeferredCommand(interaction, env) {
         break;
       case "compare":
       case "leaderboard":
-        payload = await createSocial(interaction, env);
+        payload = await createSocial(interaction, env, context?.exports?.LeaderboardPlayer);
         break;
       case "live":
         payload = await buildLiveResponse(interaction, env);
@@ -756,8 +756,8 @@ async function runDeferredCommand(interaction, env) {
   }
 }
 
-async function runComponent(interaction, env) {
-  try { await editOriginalResponse(interaction, (String(interaction.data.custom_id).startsWith("social:") ? await updateSocial(interaction, env) : await updateLookup(interaction, env))); }
+async function runComponent(interaction, env, context) {
+  try { await editOriginalResponse(interaction, (String(interaction.data.custom_id).startsWith("social:") ? await updateSocial(interaction, env, context?.exports?.LeaderboardPlayer) : await updateLookup(interaction, env))); }
   catch (error) {
     // A failed click must not replace a good public card with an error.
     const content = error instanceof UserFacingError ? error.message : "This card could not be updated. Try again shortly.";
@@ -848,13 +848,13 @@ export default {
       try {
         if (String(interaction.data.custom_id).startsWith("social:") && interaction.type === 3) {
           await resolveSocial(interaction, env);
-          context.waitUntil(runComponent(interaction, env));
+          context.waitUntil(runComponent(interaction, env, context));
           return json({ type: 6 });
         }
         const { view, action } = await resolveView(interaction, env);
         if (action === "champion" && interaction.type === 3) return json(championModal(view));
         if (interaction.type === 5 && action !== "choose") throw new UserFacingError("Unknown form.");
-        context.waitUntil(runComponent(interaction, env));
+        context.waitUntil(runComponent(interaction, env, context));
         return json({ type: 6 });
       } catch (error) {
         return immediateMessage(error instanceof UserFacingError ? error.message : "This card is temporarily unavailable.", { ephemeral: true });
@@ -881,7 +881,7 @@ export default {
         // accidentally be posted publicly. Storage failure is fail-closed.
         const effective = administrative ? interaction : withDefaults(interaction, await readProfile(interaction, env));
         if (!administrative && interaction.data.name !== "leaderboard" && !optionsObject(effective).summoner) return immediateMessage("Choose a summoner or save one with `/profile set summoner:...`.", { ephemeral: true });
-        context.waitUntil(runDeferredCommand(effective, env));
+        context.waitUntil(runDeferredCommand(effective, env, context));
         return deferredMessage(administrative || Boolean(optionsObject(effective).private));
       } catch (error) {
         return immediateMessage(error instanceof UserFacingError ? error.message : "Your settings could not be loaded. Nothing was posted publicly; try again shortly.", { ephemeral: true });

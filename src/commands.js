@@ -58,7 +58,7 @@ export const LEADERBOARD_METRICS = [
 
 export const COMMANDS = [
   {
-    name: "leaderboard", type: 1, description: "Rank the active tracked roster; load players in batches", dm_permission: false,
+    name: "leaderboard", type: 1, description: "Automatically rank up to 10 active tracked players", dm_permission: false,
     options: [
       { name: "metric", description: "Sort by (default win rate)", type: 3, choices: LEADERBOARD_METRICS.map(([name, value]) => ({ name, value })) },
       daysOption, modeOption,

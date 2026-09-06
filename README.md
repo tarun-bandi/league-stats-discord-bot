@@ -56,9 +56,10 @@ Omit `champion` for the existing overall stats. Riot may not expose completed AR
 
 - `/leaderboard metric:Win rate days:7 mode:Ranked Solo/Duo min_games:5`
   ranks active (not paused or archived) NA accounts in the configured tracking server.
-  It captures the roster and time window, loads the first player, and provides a
-  **Load next player** button. Only the requester can load it; the card expires
-  after one hour. Standings are labeled incomplete until every player is loaded.
+  It automatically loads the entire active roster, up to **10 players**, using a
+  fixed time window. No per-player clicks are needed. If a lookup fails or times
+  out, the card labels the missing players and offers **Retry missing players**
+  to its requester for one hour. Successful results are preserved on retry.
 - Metrics: win rate, KDA, CS/min, damage/min, average vision, hours played and
   games played. The default minimum is five sampled games; missing metrics do
   not qualify, and equal values share a rank.
@@ -69,7 +70,10 @@ Omit `champion` for the existing overall stats. Riot may not expose completed AR
   Leaderboards always use NA, regardless of your saved region.
 
 To fit the Worker request budget, leaderboards sample the newest **30 games per
-player**, loaded one player per interaction; comparisons sample **15 per player**.
+player**, fetched automatically through private Worker RPC calls; comparisons
+sample **15 per player**. Each player lookup stays within the free external
+request budget. Two players load concurrently, with a 24-second total loading
+deadline so the bot can return a partial result instead of leaving Discord waiting.
 These are sampled totals, including hours/games played, not guaranteed totals for
 an entire week or month. Capped samples are labeled. Empty periods and unavailable
 metrics are explicit. These commands do not enroll accounts or change monitor state.
