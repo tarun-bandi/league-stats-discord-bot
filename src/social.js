@@ -15,7 +15,7 @@ const integer = (value, fallback, max) => {
   return n;
 };
 
-async function playerStats(query, env, window, count) {
+export async function playerStats(query, env, window, count) {
   const interaction = asInteraction(query);
   const account = await resolveAccount(env, parseRiotId(query.summoner), getRegion(interaction));
   const snapshot = { startTime: window.startTime, endTime: window.endTime, account, matches: [], offset: 0 };
@@ -42,17 +42,18 @@ export function renderLeaderboard(view) {
   const ranked = rankPlayers(view.players, metric, view.query.min_games);
   const excluded = view.players.filter((p) => p.games < view.query.min_games || !Number.isFinite(p[metric]));
   const payload = featureMessage("", [{ title: `Tracked roster — ${label}${pending ? " (incomplete)" : ""}`,
-    description: `${context(view)}\nNA • ${view.players.length}/${view.roster.length} players loaded • Minimum ${view.query.min_games} sampled games\n${pending ? "Load the remaining players before treating these as final standings." : "Standings cover the active roster captured when this card was created."}\n${modeNote(view.query.mode) || ""}`,
+    description: `${context(view)}\nNA • ${view.players.length}/${view.roster.length} players loaded • Minimum ${view.query.min_games} sampled games\n${pending ? "Some player lookups failed or timed out. Retry to complete the standings." : "Standings cover the active roster captured when this card was created."}\n${modeNote(view.query.mode) || ""}`,
     fields: [
       ...lineFields(pending ? "Provisional standings" : "Standings", ranked.length ? ranked.map((p) => `**${p.position}. ${p.name}** — ${format(metric, p[metric])} • ${p.wins}W–${p.losses}L (${p.games}g${p.capped ? ", capped" : ""})`) : ["No qualifying players loaded."]),
+      ...lineFields("Could not load", (view.failures ?? []).map((failure) => `${safeName(failure.summoner)}: ${failure.error}`)),
       ...lineFields("Not qualified", excluded.map((p) => `${p.name}: ${p.games} games${!Number.isFinite(p[metric]) ? "; metric unavailable" : ""}`)),
     ], footer: { text: "Newest 30 games per player in this window • Capped samples can omit older games • Ties share a rank" },
   }]);
-  payload.components = [{ type: 1, components: [{ type: 2, style: 1, label: pending ? "Load next player" : "All players loaded", custom_id: `social:${view.id}:next`, disabled: !pending }] }];
+  payload.components = pending ? [{ type: 1, components: [{ type: 2, style: 1, label: "Retry missing players", custom_id: `social:${view.id}:next` }] }] : [];
   return payload;
 }
 
-export async function createSocial(interaction, env) {
+export async function createSocial(interaction, env, playerService) {
   const options = optionsObject(interaction);
   const query = { ...options, days: integer(options.days, 7, 30), mode: getMode(interaction) };
   const endTime = Math.floor(Date.now() / 1000);
@@ -83,7 +84,7 @@ export async function createSocial(interaction, env) {
   if (!roster.length) throw new UserFacingError("No active tracked players. An admin can add or resume accounts with /track.");
   const view = { id: crypto.randomUUID(), owner: userId(interaction), guild: interaction.guild_id, channel: interaction.channel_id,
     query: { days: query.days, mode: query.mode, region: "na", metric: query.metric, min_games: query.min_games }, ...window, roster, players: [], expires: Date.now() + TTL };
-  view.players.push(await playerStats({ ...view.query, summoner: roster[0] }, env, window, 30));
+  await loadRoster(view, playerService);
   await writeRecord(env.MONITOR_DB, `social:${view.id}`, view, view.expires);
   return renderLeaderboard(view);
 }
@@ -97,17 +98,49 @@ export async function resolveSocial(interaction, env) {
   return view;
 }
 
-export async function updateSocial(interaction, env) {
+export async function updateSocial(interaction, env, playerService) {
   const initial = await resolveSocial(interaction, env);
   const key = `social:${initial.id}`, owner = crypto.randomUUID();
   if (!await leaseRecord(env.MONITOR_DB, key, owner)) throw new UserFacingError("This leaderboard is already updating. Try again shortly.");
   try {
     const view = await resolveSocial(interaction, env);
-    if (view.players.length < view.roster.length) {
-      const player = await playerStats({ ...view.query, summoner: view.roster[view.players.length] }, env, view, 30);
-      view.players.push(player);
-      await writeRecord(env.MONITOR_DB, key, view, view.expires);
-    }
+    await loadRoster(view, playerService);
+    await writeRecord(env.MONITOR_DB, key, view, view.expires);
     return renderLeaderboard(view);
   } finally { await releaseRecord(env.MONITOR_DB, key, owner); }
+}
+
+// Each RPC is a separate Worker invocation with its own external request budget.
+// Run at most two players concurrently, and leave time for D1 + the Discord PATCH
+// within the HTTP waitUntil deadline. No interaction tokens leave the caller.
+export async function loadRoster(view, playerService, timeoutMs = 24000) {
+  if (!playerService?.load) throw new UserFacingError("Leaderboard loading is temporarily unavailable. Try again shortly.");
+  const completed = new Map(view.players.map((p) => [p.summoner ?? p.name, p]));
+  const pending = view.roster.filter((id) => !completed.has(id));
+  const results = new Map();
+  const deadline = Date.now() + timeoutMs;
+  let next = 0;
+  async function consume() {
+    while (next < pending.length) {
+      const summoner = pending[next++];
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        results.set(summoner, { error: "Lookup timed out. Please retry." });
+        continue;
+      }
+      let timer;
+      try {
+        const result = await Promise.race([
+          playerService.load({ ...view.query, summoner }, { startTime: view.startTime, endTime: view.endTime }),
+          new Promise((resolve) => { timer = setTimeout(() => resolve({ error: "Lookup timed out. Please retry." }), remaining); }),
+        ]);
+        results.set(summoner, result?.player ? { player: { ...result.player, summoner } } : { error: result?.error || "Player data is unavailable. Please retry." });
+      } catch {
+        results.set(summoner, { error: "Player data is unavailable. Please retry." });
+      } finally { clearTimeout(timer); }
+    }
+  }
+  await Promise.all([consume(), consume()]);
+  view.players = view.roster.flatMap((id) => completed.has(id) ? [completed.get(id)] : results.get(id)?.player ? [results.get(id).player] : []);
+  view.failures = pending.filter((id) => !results.get(id)?.player).map((summoner) => ({ summoner, error: results.get(summoner)?.error || "Please retry." }));
 }
