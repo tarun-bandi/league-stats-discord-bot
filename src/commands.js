@@ -57,6 +57,12 @@ export const LEADERBOARD_METRICS = [
 ];
 
 export const COMMANDS = [
+  { name: "summary", type: 1, description: "Last seven days of tracked games, highlights and observed LP gains", dm_permission: false, options: [privateOption] },
+  { name: "weekly", type: 1, description: "Configure Monday 16:00 UTC server recaps", dm_permission: false, default_member_permissions: "32", options: [
+    { name: "enable", type: 1, description: "Post weekly recaps in this channel starting next Monday at 16:00 UTC" },
+    { name: "disable", type: 1, description: "Stop automatic weekly recaps" },
+    { name: "status", type: 1, description: "Show weekly recap schedule and delivery status" },
+  ] },
   {
     name: "leaderboard", type: 1, description: "Automatically rank up to 10 active tracked players", dm_permission: false,
     options: [

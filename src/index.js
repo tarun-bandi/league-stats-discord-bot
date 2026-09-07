@@ -1,3 +1,4 @@
+import { summaryCommand, weeklyCommand, assertRecapGuild, runWeeklyRecap } from "./recap.js";
 import { UserFacingError, RiotRateLimitError } from "./errors.js";
 import { cacheKey, cacheRead, cacheWrite, checkRiotCooldown, recordRiotCooldown } from "./data-cache.js";
 import { buildOpggResponse } from "./opgg.js";
@@ -695,7 +696,7 @@ function helpResponse() {
           {
             name: "Commands",
             value:
-              "`/stats` — champion stats, period buttons and cached load-more\n`/leaderboard` — automatically rank up to 10 active tracked players\n`/compare` — two players, same period and mode\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
+              "`/stats` — champion stats, period buttons and cached load-more\n`/leaderboard` — automatically rank up to 10 active tracked players\n`/compare` — two players, same period and mode\n`/summary` — weekly highlights and observed LP gains\n`/weekly enable/disable/status` — Monday recap delivery\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
             inline: false,
           },
           {
@@ -751,6 +752,12 @@ async function runDeferredCommand(interaction, env, context) {
       case "profile":
         payload = await profileCommand(interaction, env);
         break;
+      case "summary":
+        payload = await summaryCommand(interaction, env);
+        break;
+      case "weekly":
+        payload = await weeklyCommand(interaction, env);
+        break;
       case "track":
         payload = featureMessage(await trackingCommand(interaction, env));
         break;
@@ -795,7 +802,7 @@ async function runComponent(interaction, env, context) {
 }
 
 export default {
-  async scheduled(controller, env) {
+  async scheduled(controller, env, context) {
     try {
       await runLeagueMonitor(env, {
         detectionTimestamp: controller.scheduledTime || Date.now(),
@@ -807,6 +814,11 @@ export default {
         error instanceof Error ? error.message : String(error),
       );
       throw error;
+    } finally {
+      try {
+        if (context?.exports?.WeeklyRecap) await context.exports.WeeklyRecap.run(controller.scheduledTime || Date.now());
+        else await runWeeklyRecap(env, controller.scheduledTime || Date.now());
+      } catch (error) { console.error("Weekly recap failed", error instanceof Error ? error.message : String(error)); }
     }
   },
 
@@ -899,14 +911,15 @@ export default {
       return json({ type: 4, data: helpResponse() });
     }
 
-    if (["stats", "recent", "live", "session", "profile", "track", "compare", "leaderboard"].includes(interaction.data?.name)) {
+    if (["stats", "recent", "live", "session", "profile", "track", "compare", "leaderboard", "summary", "weekly"].includes(interaction.data?.name)) {
       try {
-        const administrative = ["profile", "track"].includes(interaction.data.name);
-        if (interaction.data.name === "track") assertMonitorAdmin(interaction, env);
+        const administrative = ["profile", "track", "weekly"].includes(interaction.data.name);
+        if (["track", "weekly"].includes(interaction.data.name)) assertMonitorAdmin(interaction, env);
+        if (interaction.data.name === "summary") assertRecapGuild(interaction, env);
         // Read preferences before acknowledging so a private default can never
         // accidentally be posted publicly. Storage failure is fail-closed.
         const effective = administrative ? interaction : withDefaults(interaction, await readProfile(interaction, env));
-        if (!administrative && interaction.data.name !== "leaderboard" && !optionsObject(effective).summoner) return immediateMessage("Choose a summoner or save one with `/profile set summoner:...`.", { ephemeral: true });
+        if (!administrative && !["leaderboard", "summary"].includes(interaction.data.name) && !optionsObject(effective).summoner) return immediateMessage("Choose a summoner or save one with `/profile set summoner:...`.", { ephemeral: true });
         context.waitUntil(runDeferredCommand(effective, env, context));
         return deferredMessage(administrative || Boolean(optionsObject(effective).private));
       } catch (error) {

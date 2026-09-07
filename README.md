@@ -252,3 +252,42 @@ opinions of Riot Games or anyone officially involved in producing or managing
 Riot Games properties. Riot Games and all associated properties are trademarks
 or registered trademarks of Riot Games, Inc. The original code is MIT-licensed;
 Riot assets and data are not relicensed by this project.
+
+## Weekly summaries and LP gains
+
+- `/summary` shows the last seven days of saved monitor observations, with
+  `private:true` available. It respects your saved privacy preference and is
+  restricted to the configured tracking server.
+- `/weekly enable` opts the server into a recap **in the channel where you run
+  it**, every Monday at **16:00 UTC**. The first post is at the next scheduled
+  Monday, covering the preceding seven days. Manage Server or Administrator
+  permission is required. Ensure the bot can view that channel, send messages,
+  and embed links.
+- `/weekly status` shows the channel, next delivery time and last delivery status;
+  `/weekly disable` stops scheduled posts. Settings responses are private.
+  Recaps are disabled by default and also respect `MONITOR_ENABLED`.
+
+Summaries include each non-archived tracked player's observed W–L record,
+most games, best win rate (minimum five observed games), longest observed loss
+streak, and separate **Solo/Duo and Flex net LP changes**. Promotions and demotions
+are included in net ranked progress; Master/Grandmaster/Challenger use the same
+LP scale. Biggest-climber highlights require observations near both ends of the
+period; ties use roster order. Paused trackers are labeled; up to ten players
+are included. Games shared by tracked players count once per player.
+
+These summaries read existing D1 history and make **no Riot or OP.GG requests**.
+They do not reconstruct missing games or per-game LP. The match window uses game
+start times, includes the start and excludes the end. LP shows the exact first
+and last observation timestamps within that window. Insufficient history,
+missing ranked queues, ranked counter resets, or gaps exceeding 48 hours produce
+an unavailable LP value. New/resumed tracking starts a new comparison period;
+shorter or stale histories are labeled partial. Pauses and outages may leave
+match history incomplete. History retention can also limit the LP sample.
+
+Delivery uses the existing minute cron and a separate Worker invocation, with
+D1 leases and a durable attempt marker. Confirmed Discord 4xx failures retry
+with backoff (429 respects Retry-After). An ambiguous timeout, 5xx, or crash after
+starting delivery suppresses automatic resends to avoid duplicate posts; check
+`/weekly status` and use `/summary` if needed. After a prolonged outage, only the
+latest due week is posted. All recap messages suppress mentions. Existing match
+cursors, roster baselines and historical alerts are never modified by recaps.
