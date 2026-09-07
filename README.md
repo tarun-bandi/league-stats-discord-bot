@@ -291,3 +291,31 @@ starting delivery suppresses automatic resends to avoid duplicate posts; check
 `/weekly status` and use `/summary` if needed. After a prolonged outage, only the
 latest due week is posted. All recap messages suppress mentions. Existing match
 cursors, roster baselines and historical alerts are never modified by recaps.
+
+## Rank and LP graphs
+
+`/lpgraph summoner:Name#Tag days:7 queue:both` attaches separate Solo/Duo and Flex
+PNG graphs directly to the Discord response. `days` accepts 1–30 (default 7),
+`queue` accepts Both/Solo/Duo/Flex, and `private:true` keeps the response private.
+Your saved summoner and privacy defaults apply. The command uses the configured
+NA tracking roster, including retained history from paused or archived players.
+It does not require a new Riot request or upload history to a chart service.
+
+Each graph shows rank + LP, UTC dates/times, exact observations, net LP change,
+peak rank and latest observed rank. Promotions/demotions use a continuous ranked
+progress scale; Master/Grandmaster/Challenger share the same LP scale. Step lines
+connect nearby observations only. Missing queues, ranked counter resets,
+resumed tracking and gaps exceeding two hours break the line. A net change is
+not reported across those breaks. One observation appears as a dot, not a trend;
+no observations produce an explanatory card. Partial periods and stale latest
+observations are labeled, and the requested date range remains visible.
+
+**Historical backfill:** existing saved rank history is used automatically.
+Riot's [League-v4 and Match-v5 API schemas](https://developer.riotgames.com/apis)
+expose current ranked entries and match details, not dated historical LP in
+match results. OP.GG's public page can contain timestamped `lpHistories` snapshots,
+but the inspected payload did not identify their ranked queue. They are therefore
+not imported into either queue's graph. Partial cards link to the player's OP.GG
+page for inspection. Wins/losses, season-end ranks and undocumented server actions
+are not used to manufacture daily LP history. Current monitor retention is up to
+32 days and 500 observations per player, so busy accounts can have shorter coverage.
