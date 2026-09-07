@@ -57,6 +57,11 @@ export const LEADERBOARD_METRICS = [
 ];
 
 export const COMMANDS = [
+  { name: "lpgraph", type: 1, description: "Graph a tracked player's observed rank and LP over 1–30 days", dm_permission: false, options: [
+    riotIdOption, daysOption,
+    { name: "queue", description: "Ranked queue (default both)", type: 3, choices: [{ name: "Both", value: "both" }, { name: "Solo/Duo", value: "solo" }, { name: "Flex", value: "flex" }] },
+    privateOption,
+  ] },
   { name: "summary", type: 1, description: "Last seven days of tracked games, highlights and observed LP gains", dm_permission: false, options: [privateOption] },
   { name: "weekly", type: 1, description: "Configure Monday 16:00 UTC server recaps", dm_permission: false, default_member_permissions: "32", options: [
     { name: "enable", type: 1, description: "Post weekly recaps in this channel starting next Monday at 16:00 UTC" },

@@ -1,3 +1,4 @@
+import { lpGraphCommand, responseBody } from "./lp-graph.js";
 import { summaryCommand, weeklyCommand, assertRecapGuild, runWeeklyRecap } from "./recap.js";
 import { UserFacingError, RiotRateLimitError } from "./errors.js";
 import { cacheKey, cacheRead, cacheWrite, checkRiotCooldown, recordRiotCooldown } from "./data-cache.js";
@@ -105,7 +106,7 @@ export async function autocompleteResponse(interaction, env) {
   }
   if (
     !["summoner", "opponent"].includes(focused?.name) ||
-    !["stats", "recent", "live", "session", "profile", "track", "compare", "leaderboard"].includes(interaction.data?.name)
+    !["stats", "recent", "live", "session", "profile", "track", "compare", "leaderboard", "lpgraph"].includes(interaction.data?.name)
   ) {
     return json({ type: 8, data: { choices: [] } });
   }
@@ -696,7 +697,7 @@ function helpResponse() {
           {
             name: "Commands",
             value:
-              "`/stats` — champion stats, period buttons and cached load-more\n`/leaderboard` — automatically rank up to 10 active tracked players\n`/compare` — two players, same period and mode\n`/summary` — weekly highlights and observed LP gains\n`/weekly enable/disable/status` — Monday recap delivery\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
+              "`/stats` — champion stats, period buttons and cached load-more\n`/leaderboard` — automatically rank up to 10 active tracked players\n`/compare` — two players, same period and mode\n`/summary` — weekly highlights and observed LP gains\n`/lpgraph` — rank and LP history charts\n`/weekly enable/disable/status` — Monday recap delivery\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
             inline: false,
           },
           {
@@ -721,8 +722,7 @@ async function editOriginalResponse(interaction, payload) {
   const url = `${DISCORD_API}/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`;
   const response = await fetch(url, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    ...responseBody(payload),
   });
   if (!response.ok) {
     throw new Error(`Discord follow-up failed with HTTP ${response.status}`);
@@ -751,6 +751,9 @@ async function runDeferredCommand(interaction, env, context) {
         break;
       case "profile":
         payload = await profileCommand(interaction, env);
+        break;
+      case "lpgraph":
+        payload = await lpGraphCommand(interaction, env);
         break;
       case "summary":
         payload = await summaryCommand(interaction, env);
@@ -911,11 +914,11 @@ export default {
       return json({ type: 4, data: helpResponse() });
     }
 
-    if (["stats", "recent", "live", "session", "profile", "track", "compare", "leaderboard", "summary", "weekly"].includes(interaction.data?.name)) {
+    if (["stats", "recent", "live", "session", "profile", "track", "compare", "leaderboard", "summary", "weekly", "lpgraph"].includes(interaction.data?.name)) {
       try {
         const administrative = ["profile", "track", "weekly"].includes(interaction.data.name);
         if (["track", "weekly"].includes(interaction.data.name)) assertMonitorAdmin(interaction, env);
-        if (interaction.data.name === "summary") assertRecapGuild(interaction, env);
+        if (["summary", "lpgraph"].includes(interaction.data.name)) assertRecapGuild(interaction, env);
         // Read preferences before acknowledging so a private default can never
         // accidentally be posted publicly. Storage failure is fail-closed.
         const effective = administrative ? interaction : withDefaults(interaction, await readProfile(interaction, env));
