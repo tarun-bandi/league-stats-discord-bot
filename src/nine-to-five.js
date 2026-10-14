@@ -20,7 +20,7 @@ export function workdayRows(state, date, now, savedRoster = []) {
     return {
       stateKey, riotId: tracker.summoner.riot_id, count,
       partial: paused || enrolled > start,
-      delayed: !Number.isFinite(checked) || checked < Math.min(now, end) - 10 * 60_000,
+      delayed: tracker.observation_deferred?.some((item) => ["account", "completed", "live"].includes(item.stage)) || !Number.isFinite(checked) || checked < Math.min(now, end) - 10 * 60_000,
       include: savedRoster.includes(stateKey) || count > 0 || (!paused && (!Number.isFinite(enrolled) || enrolled < end)),
     };
   }).filter((row) => row.include).sort((a, b) => b.count - a.count || a.riotId.localeCompare(b.riotId));

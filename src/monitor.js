@@ -7,6 +7,7 @@ import { getChampionCatalog, championInfo } from "./champions.js";
 import { riotKeyFingerprint } from "./riot-key.js";
 import { reportCredentialHealth, confirmCredentialFailure } from "./health.js";
 import { rememberWorkdayGame } from "./workday.js";
+import { RiotRateLimitError } from "./errors.js";
 
 const STATE_KEY = "league-game-monitor";
 const DISCORD_API = "https://discord.com/api/v10";
@@ -160,8 +161,8 @@ async function riotJson(
   { allowNotFound = false, allowInvalidIdentifier = false } = {},
 ) {
   if (!env.RIOT_API_KEY) throw new Error("RIOT_API_KEY is not configured");
-  if (env.riotBudget && env.riotBudget.remaining-- <= 0) throw Object.assign(new Error("Monitor request budget reached"), { budgetExceeded: true });
   await checkRiotCooldown(env, url);
+  if (env.riotBudget && env.riotBudget.remaining-- <= 0) throw Object.assign(new Error("Monitor request budget reached"), { budgetExceeded: true });
   const response = await fetch(url, {
     headers: { "X-Riot-Token": env.RIOT_API_KEY },
   });
@@ -820,6 +821,13 @@ export async function monitorStatus(env) {
     ...configuration,
     stateValid: true,
     lastCheckAt: state.last_check_at ?? null,
+    lastRun: state.monitor_last_run ?? null,
+    checks: trackerEntries(state).filter(({ tracker }) => !tracker.removed_at).map(({ tracker }) => ({
+      summoner: tracker.summoner.riot_id,
+      completedAt: tracker.completed_checked_at ?? null,
+      liveAt: tracker.live_checked_at ?? null,
+      deferred: tracker.observation_deferred ?? [],
+    })),
     pendingLiveAlerts: trackerEntries(state).reduce(
       (total, { tracker }) => total + pendingLiveRecords(tracker).length,
       0,
@@ -842,36 +850,80 @@ async function observeTracker(env, tracker, stateKey, detectionMs, names, keyFin
   const detectionIso = new Date(detectionMs).toISOString();
   const newAlerts = [];
   const patchTargets = new Map();
-  await resolveTrackedAccount(env, tracker, detectionMs, { force: keyChanged || tracker.riot_key_fingerprint !== keyFingerprint });
+  const deferred = [];
+  const skipped = Symbol("deferred");
+  const attempt = async (stage, request) => {
+    const prior = tracker.observation_deferred?.find((item) => item.stage === stage);
+    // Persist stage backoff separately from cursors; never probe before Riot's
+    // deadline. Repeated failures back off further instead of hammering per minute.
+    if (!keyChanged && prior?.reason === "rate_limit" && prior.retryAt > Date.now()) {
+      deferred.push(prior);
+      return skipped;
+    }
+    try { return await request(); }
+    catch (error) {
+      if (error instanceof RiotRateLimitError) {
+        const attempts = Math.min(4, (prior?.attempts ?? 0) + 1);
+        deferred.push({ stage, reason: "rate_limit", attempts,
+          retryAt: Math.max(error.retryAt, Date.now() + Math.min(15, 2 ** attempts) * 60_000) });
+        return skipped;
+      }
+      if (error.budgetExceeded) {
+        deferred.push({ stage, reason: "request_budget" });
+        return skipped;
+      }
+      throw error;
+    }
+  };
+  const finish = () => {
+    tracker.observation_deferred = deferred;
+    tracker.last_attempt_at = detectionIso;
+    if (!deferred.length) tracker.last_check_at = detectionIso;
+    return { newAlerts, patchTargets, deferred };
+  };
+  if (await attempt("account", () => resolveTrackedAccount(env, tracker, detectionMs, { force: keyChanged || tracker.riot_key_fingerprint !== keyFingerprint })) === skipped) return finish();
   tracker.riot_key_fingerprint = keyFingerprint;
   const addPatch = (game) => {
     if (game.patch_message_id) patchTargets.set(String(game.patch_message_id), { messageId: String(game.patch_message_id), channelId: game.patch_channel_id });
   };
-  for (const game of await reconcilePendingLiveGames(env, tracker, detectionIso)) {
+  // A failed completed-history scan must not advance its cursor or leave behind
+  // partially reconciled records. Later live/rank throttling cannot discard a
+  // successful completed scan. All Discord delivery still precedes the D1 commit.
+  const completion = await attempt("completed", async () => {
+    const copy = structuredClone(tracker);
+    const reconciled = await reconcilePendingLiveGames(env, copy, detectionIso);
+    const completed = tracker.monitor_paused || tracker.removed_at ? [] : await completedUpdates(env, copy, detectionIso);
+    copy.completed_checked_at = detectionIso;
+    Object.assign(tracker, copy);
+    return { reconciled, completed };
+  });
+  for (const game of completion === skipped ? [] : completion.reconciled) {
     rememberWorkdayGame(tracker, game.record, detectionMs);
     game.record.champion_icon_url = championInfo(names, game.record.champion_id ?? game.record.champion)?.icon ?? game.record.champion_icon_url;
     addPatch(game);
   }
-  if (tracker.monitor_paused || tracker.removed_at) return { newAlerts, patchTargets };
-  const completed = await completedUpdates(env, tracker, detectionIso);
+  if (tracker.monitor_paused || tracker.removed_at) return finish();
+  const completed = completion === skipped ? [] : completion.completed;
   for (const game of completed) {
     rememberWorkdayGame(tracker, game, detectionMs);
     if (game.record) game.record.champion_icon_url = championInfo(names, game.champion_id ?? game.champion)?.icon ?? game.record.champion_icon_url;
     if (game.is_new_alert) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: game.record });
     addPatch(game);
   }
-  const live = await activeGame(env, tracker, detectionIso, names);
-  rememberWorkdayGame(tracker, live, detectionMs);
-  tracker.newest_live_game_id = live?.live_game_id ?? null;
-  const newLive = alertMode === "completed" ? null : addLiveUpdate(tracker, live);
-  if (newLive) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: newLive.record });
+  const live = await attempt("live", () => activeGame(env, tracker, detectionIso, names));
+  if (live !== skipped) {
+    rememberWorkdayGame(tracker, live, detectionMs);
+    tracker.live_checked_at = detectionIso;
+    tracker.newest_live_game_id = live?.live_game_id ?? null;
+    const newLive = alertMode === "completed" ? null : addLiveUpdate(tracker, live);
+    if (newLive) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: newLive.record });
+  }
   const lastRankMs = Date.parse(tracker.rank_checked_at ?? "");
   if (!Number.isFinite(lastRankMs) || detectionMs - lastRankMs >= RANK_POLL_MS || completed.some((game) => [420, 440].includes(game.queue_id))) {
-    const ranked = await riotJson(env, `https://${NA_REGION.platform}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(tracker.summoner.puuid)}`);
-    for (const record of observeRanks(tracker, ranked, detectionIso)) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record });
+    const ranked = await attempt("rank", () => riotJson(env, `https://${NA_REGION.platform}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(tracker.summoner.puuid)}`));
+    if (ranked !== skipped) for (const record of observeRanks(tracker, ranked, detectionIso)) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record });
   }
-  tracker.last_check_at = detectionIso;
-  return { newAlerts, patchTargets };
+  return finish();
 }
 
 export async function runLeagueMonitor(env, options = {}) {
@@ -903,6 +955,7 @@ export async function runLeagueMonitor(env, options = {}) {
     await syncDiscordApplication(env, state);
     const entries = trackerEntries(state).filter(({ tracker }) => !tracker.monitor_paused && !tracker.removed_at || pendingLiveRecords(tracker).length);
     const start = (state.monitor_next_index ?? 0) % Math.max(1, entries.length);
+    let checked = 0, processed = 0;
     for (let step = 0; step < entries.length; step++) {
       const index = (start + step) % entries.length;
       const { stateKey, tracker: saved } = entries[index];
@@ -916,10 +969,15 @@ export async function runLeagueMonitor(env, options = {}) {
       catch (error) { if (error.budgetExceeded) break; throw error; }
       if (newAlerts.length + observed.newAlerts.length > 10) break;
       Object.assign(saved, tracker);
+      processed++;
+      if (!observed.deferred.length) checked++;
       newAlerts.push(...observed.newAlerts);
       for (const [id, target] of observed.patchTargets) patchTargets.set(id, target);
-      state.monitor_next_index = (index + 1) % entries.length;
+      state.monitor_next_index = observed.deferred.some((item) => item.reason === "request_budget") ? index : (index + 1) % entries.length;
+      if (env.riotBudget.remaining <= 0) break;
     }
+    const status = checked === entries.length ? "ok" : "partial";
+    state.monitor_last_run = { status, at: detectionIso, processed, checked, total: entries.length };
     await commitMonitorChanges(env, {
       state,
       owner,
@@ -929,7 +987,7 @@ export async function runLeagueMonitor(env, options = {}) {
     });
     if (env.DISCORD_GUILD_ID && env.riotBudget.successes) await reportCredentialHealth(env, "ok", state, detectionMs);
     return {
-      status: "ok",
+      status,
       newAlerts: newAlerts.length,
       updatedMessages: patchTargets.size,
       transport: "bot",

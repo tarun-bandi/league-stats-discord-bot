@@ -248,6 +248,17 @@ The one-minute scheduler rotates unfinished work when its request budget is used
 larger rosters or backlogs may take multiple ticks. Each tracker retains its own
 cursor. Existing live alerts finish even after pause/removal or an alert-mode change.
 
+Riot rate limits defer only the affected account/completed/live/rank check. Successful
+checks are saved after any required Discord deliveries succeed; failed completed
+scans retain their cursors and failed live lookups never mean “not in game.” Each
+deferred check honors Riot's Retry-After and backs off for 2, 4, 8, then 15 minutes
+on repeated throttling. Other accounts and available data sources keep progressing.
+`/monitor/status` exposes `lastRun.status` (`ok` or `partial`), per-player completed
+and live check times, and deferred stages/retry times. `lastCheckAt` is the last
+committed monitor tick, not proof that every source succeeded. The 9–5 report warns
+when game observations are incomplete. Authentication, unexpected source, and Discord
+failures still prevent the affected invocation from committing authoritative state.
+
 `/track alerts mode:Completed only` suppresses new live announcements but retains
 completion and demotion alerts. `Live + completed` restores the original policy.
 The slash commands can query other regions/accounts without enrolling them.
