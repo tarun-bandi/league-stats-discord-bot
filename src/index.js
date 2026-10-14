@@ -17,6 +17,7 @@ import { readProfile, withDefaults, commandOptions, optionsObject } from "./pref
 import { createLookup, updateLookup, resolveView, championModal, profileCommand, featureMessage } from "./features.js";
 import { trackingCommand, assertMonitorAdmin } from "./tracking.js";
 import { readRecord, purgeExpiredRecords } from "./store.js";
+import { nineToFiveCommand, nineToFiveStatus, runNineToFive } from "./nine-to-five.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const MAX_STATS_MATCHES = 30;
@@ -100,7 +101,7 @@ export async function autocompleteResponse(interaction, env) {
   }
   if (
     focused?.name !== "summoner" ||
-    !["stats", "recent", "live", "session", "profile", "track"].includes(interaction.data?.name)
+    !["stats", "recent", "live", "session", "profile", "track", "9-5"].includes(interaction.data?.name)
   ) {
     return json({ type: 8, data: { choices: [] } });
   }
@@ -672,7 +673,7 @@ function helpResponse() {
           {
             name: "Commands",
             value:
-              "`/stats` — champion stats, period buttons and cached load-more\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
+              "`/stats` — champion stats, period buttons and cached load-more\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/9-5` — tracked players' 9 AM–5 PM Eastern game counts; daily channel report after 5 PM\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
             inline: false,
           },
           {
@@ -723,6 +724,9 @@ async function runDeferredCommand(interaction, env) {
       case "track":
         payload = featureMessage(await trackingCommand(interaction, env));
         break;
+      case "9-5":
+        payload = await nineToFiveCommand(interaction, env);
+        break;
       default:
         payload = message("Unknown command.");
     }
@@ -765,18 +769,18 @@ async function runComponent(interaction, env) {
 
 export default {
   async scheduled(controller, env) {
-    try {
-      await runLeagueMonitor(env, {
-        detectionTimestamp: controller.scheduledTime || Date.now(),
-      });
-      if (monitorEnabled(env) && env.MONITOR_DB && new Date(controller.scheduledTime || Date.now()).getUTCMinutes() === 0) await purgeExpiredRecords(env.MONITOR_DB);
-    } catch (error) {
-      console.error(
-        "League Game Monitor failed",
-        error instanceof Error ? error.message : String(error),
-      );
-      throw error;
+    // The report still surfaces (with a delayed-data warning) during a Riot
+    // outage or a busy monitor. It never writes the authoritative game state.
+    const results = await Promise.allSettled([
+      runLeagueMonitor(env, { detectionTimestamp: controller.scheduledTime || Date.now() }),
+      runNineToFive(env),
+    ]);
+    for (const [index, result] of results.entries()) {
+      if (result.status === "rejected") console.error(index === 0 ? "League Game Monitor failed" : "9–5 tracker failed", result.reason instanceof Error ? result.reason.message : String(result.reason));
     }
+    if (monitorEnabled(env) && env.MONITOR_DB && new Date(controller.scheduledTime || Date.now()).getUTCMinutes() === 0) await purgeExpiredRecords(env.MONITOR_DB);
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
   },
 
   async fetch(request, env, context) {
@@ -789,7 +793,7 @@ export default {
         try {
           const status = await monitorStatus(env);
           const health = await readRecord(env.MONITOR_DB, "health:riot");
-          return json({ ...status, credentialHealth: { status: health?.status ?? "unknown", changedAt: health?.changedAt ?? null, notificationPending: Boolean(health?.pending?.length), deliveryError: Boolean(health?.deliveryError) } });
+          return json({ ...status, nineToFive: await nineToFiveStatus(env), credentialHealth: { status: health?.status ?? "unknown", changedAt: health?.changedAt ?? null, notificationPending: Boolean(health?.pending?.length), deliveryError: Boolean(health?.deliveryError) } });
         } catch {
           return json(
             {
@@ -863,14 +867,16 @@ export default {
       return json({ type: 4, data: helpResponse() });
     }
 
-    if (["stats", "recent", "live", "session", "profile", "track"].includes(interaction.data?.name)) {
+    if (["stats", "recent", "live", "session", "profile", "track", "9-5"].includes(interaction.data?.name)) {
       try {
         const administrative = ["profile", "track"].includes(interaction.data.name);
         if (interaction.data.name === "track") assertMonitorAdmin(interaction, env);
         // Read preferences before acknowledging so a private default can never
         // accidentally be posted publicly. Storage failure is fail-closed.
-        const effective = administrative ? interaction : withDefaults(interaction, await readProfile(interaction, env));
-        if (!administrative && !optionsObject(effective).summoner) return immediateMessage("Choose a summoner or save one with `/profile set summoner:...`.", { ephemeral: true });
+        const profile = administrative ? {} : await readProfile(interaction, env);
+        // /9-5 defaults to everyone, not the user's saved summoner/region/zone.
+        const effective = administrative ? interaction : withDefaults(interaction, interaction.data.name === "9-5" ? { private: profile.private ?? false } : profile);
+        if (!administrative && interaction.data.name !== "9-5" && !optionsObject(effective).summoner) return immediateMessage("Choose a summoner or save one with `/profile set summoner:...`.", { ephemeral: true });
         context.waitUntil(runDeferredCommand(effective, env));
         return deferredMessage(administrative || Boolean(optionsObject(effective).private));
       } catch (error) {

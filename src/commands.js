@@ -117,6 +117,10 @@ export const COMMANDS = [
     dm_permission: false, options: [riotIdOption, regionOption, modeOption, privateOption],
   },
   {
+    name: "9-5", type: 1, description: "Games started today between 9 AM and 5 PM Eastern; defaults to the tracked roster",
+    dm_permission: false, options: [riotIdOption, privateOption],
+  },
+  {
     name: "profile", type: 1, description: "Save your personal LeagueStats defaults", dm_permission: false,
     options: [
       { name: "set", description: "Save or update your defaults in this server", type: 1, options: [
