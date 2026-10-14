@@ -128,7 +128,7 @@ test("delivery failure retries with the same nonce; no cursor or reported-game m
   assert.equal((await nineToFiveStatus(env)).nextDate, date);
   assert.equal((await nineToFiveStatus(env)).deliveryError, true);
   const successful = [];
-  await runNineToFive(env, { now: close + 60_000, fetchImpl: deliver(successful) });
+  await runNineToFive(env, { now: close + 120_000, fetchImpl: deliver(successful) });
   assert.equal(successful[0].body.nonce, calls[0].nonce);
   assert.equal((await nineToFiveStatus(env)).deliveryError, false);
 });
@@ -143,6 +143,15 @@ test("failed PATCH retains the original message ID and retries an edit, never an
   assert.equal((await readRecord(db, `nine-to-five:day:${date}`)).messageId, "901");
   await runNineToFive(env, { now: close + 120_000, fetchImpl: deliver(calls) });
   assert.deepEqual(calls.map((call) => call.method), ["POST", "PATCH"]);
+});
+
+test("Discord rate-limit cooldown is durable and honors retry_after", async () => {
+  const db = testDb(fixture()); const env = envFixture(db); const calls = [];
+  await assert.rejects(runNineToFive(env, { now: close, fetchImpl: async () => Response.json({ retry_after: 180 }, { status: 429 }) }), /429/);
+  assert.equal((await runNineToFive(env, { now: close + 60_000, fetchImpl: deliver(calls) })).status, "backoff");
+  assert.equal(calls.length, 0);
+  await runNineToFive(env, { now: close + 180_000, fetchImpl: deliver(calls) });
+  assert.equal(calls.length, 1);
 });
 
 test("overlapping scheduled ticks share a lease; disabled/corrupt-state runs never post", async () => {
@@ -186,4 +195,27 @@ test("signed 9-5 interaction honors private default but never narrows roster to 
   assert.match(replies[0].embeds[0].description, /Other#NA1/);
   assert.match(replies[0].embeds[0].description, /America\/New_York/);
   assert.deepEqual(replies[0].allowed_mentions, { parse: [] });
+});
+
+test("the real scheduled handler delivers a daily report even when the monitor lease is busy", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: close });
+  const db = testDb(fixture()); const env = envFixture(db); const calls = [];
+  db.sqlite.prepare("UPDATE monitor_state SET lease_until=?,lease_owner='monitor'").run(close + 240_000);
+  t.mock.method(globalThis, "fetch", deliver(calls));
+  await worker.scheduled({ scheduledTime: close }, env);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].body.embeds[0].title, /9–5 tracker/);
+  assert.equal((await nineToFiveStatus(env)).lastReportDate, date);
+  assert.equal(db.sqlite.prepare("SELECT lease_owner FROM monitor_state").get().lease_owner, "monitor");
+});
+
+test("the scheduler still runs the daily and weekly RPCs when Riot monitoring fails", async (t) => {
+  const db = testDb(fixture()); const env = envFixture(db);
+  delete env.RIOT_API_KEY;
+  const calls = [];
+  await assert.rejects(worker.scheduled({ scheduledTime: close }, env, { exports: {
+    NineToFive: { async run() { calls.push("daily"); } },
+    WeeklyRecap: { async run() { calls.push("weekly"); } },
+  } }), /RIOT_API_KEY/);
+  assert.deepEqual(calls, ["daily", "weekly"]);
 });

@@ -25,6 +25,7 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 - Owner-only interactive cards, recent pagination and cached history up to 300 games
 - Session summaries with time played and observed (not reconstructed) LP changes
 - One-time credential-failure/recovery notifications to the configured owner
+- `/9-5` game-count leaderboard and an automatic daily report after 5 PM Eastern
 
 ## Try it
 
@@ -37,6 +38,8 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 /profile set summoner:TIXBS Chaos#NA1 mode:Ranked Solo/Duo
 /stats champion:Xerath private:true
 /session
+/9-5
+/9-5 summoner:HelloThere#9494 private:true
 ```
 
 Select `summoner` to see the three monitored accounts. Any valid Riot ID still
@@ -52,6 +55,66 @@ the sample; older champion games may be excluded. Rank stays account-wide.
 Omit `champion` for the existing overall stats. Riot may not expose completed ARAM Mayhem matches. See the
 [payload and mode guide](docs/payload.md) for exactly what we can show.
 
+## Leaderboards and comparisons
+
+- `/leaderboard metric:Win rate days:7 mode:Ranked Solo/Duo min_games:5`
+  ranks active (not paused or archived) NA accounts in the configured tracking server.
+  It automatically loads the entire active roster, up to **10 players**, using a
+  fixed time window. No per-player clicks are needed. If a lookup fails or times
+  out, the card labels the missing players and offers **Retry missing players**
+  to its requester for one hour. Successful results are preserved on retry.
+- Metrics: win rate, KDA, CS/min, damage/min, average vision, hours played and
+  games played. The default minimum is five sampled games; missing metrics do
+  not qualify, and equal values share a rank.
+- `/compare summoner:HelloThere#9494 opponent:TIXBS Chaos#NA1 days:7 mode:Ranked Solo/Duo`
+  shows two accounts side by side. `summoner` can use your saved profile default;
+  `opponent` is required. Both use the same region, rolling period and mode.
+- Both commands honor saved mode/privacy defaults and explicit `private:true`.
+  Leaderboards always use NA, regardless of your saved region.
+
+To fit the Worker request budget, leaderboards sample the newest **30 games per
+player**, fetched automatically through private Worker RPC calls; comparisons
+sample **15 per player**. Each player lookup stays within the free external
+request budget. Two players load concurrently, with a 24-second total loading
+deadline so the bot can return a partial result instead of leaving Discord waiting.
+These are sampled totals, including hours/games played, not guaranteed totals for
+an entire week or month. Capped samples are labeled. Empty periods and unavailable
+metrics are explicit. These commands do not enroll accounts or change monitor state.
+
+## Cache and rate-limit fallback
+
+Completed Riot matches are cached in D1 for seven days, using only the requested
+player's stat fields. The cache is shared across Worker invocations and new
+stats/recent/session/compare/leaderboard views; a new view fetches missing games
+rather than downloading the same match details again. Entries are isolated by
+Riot credential fingerprint, region and player. Existing account/rank/match-list
+edge caches keep their shorter TTLs. Expired records use the existing hourly cleanup.
+
+Riot HTTP 429 responses establish a shared, per-key/per-host cooldown using
+`Retry-After` (120 seconds if missing). Both interactive lookups and the monitor
+respect it. A cache failure does not break otherwise valid lookups, and failed
+Riot responses are never cached as match data.
+
+During that cooldown, stats/recent/session/compare/leaderboard lookups can use
+OP.GG's public profile HTML. The fallback makes one bounded, six-second request,
+caches validated profile data for five minutes, checks Riot ID and region, and
+filters the available match sample by the requested period. All modes, Solo/Duo,
+Flex and ARAM are supported; ambiguous queue mappings are rejected. Champion
+filters use the existing champion catalog. It does not trigger on expired keys,
+404s or arbitrary server errors.
+
+Fallback cards link to OP.GG and show retrieval/profile-update times. OP.GG's
+public structured sample currently contains up to ten recent games, which can
+be stale or incomplete. It supplies record and KDA; duration, CS/min, damage,
+vision, rank and LP are unavailable and never estimated. Unsupported metrics do
+not qualify for leaderboards. Mixed sources are labeled because their sample
+coverage can differ. OP.GG data never advances monitor cursors or generates
+monitor alerts. The monitor and live-game lookup continue to use Riot.
+
+OP.GG errors, access denials, redirects or changed markup fail closed with a
+cached backoff, without browser challenges or private API access. Source:
+[OP.GG's crawling guidance](https://help.op.gg/hc/en-us/articles/31091405109401-Can-I-use-OP-GG-data).
+
 ## Cloudflare bindings
 
 - `DISCORD_PUBLIC_KEY` — Worker secret used to verify Discord interactions
@@ -66,6 +129,44 @@ Omit `champion` for the existing overall stats. Riot may not expose completed AR
 The production Cron Trigger is `* * * * *`. The monitor does not access D1,
 Riot, or Discord while `MONITOR_ENABLED` is false. When enabled, it refuses to
 access Riot or Discord if its D1 state is missing, corrupt, or invalid.
+
+## 9–5 tracker
+
+`/9-5` shows today's counts for the tracked roster, highest count first. Select
+`summoner` to show one tracked player. It honors your private-response preference,
+but deliberately ignores saved summoner, mode and timezone defaults for the
+roster-wide report. It is available in the configured tracking server.
+
+- Window: **9:00 AM inclusive to 5:00 PM exclusive, America/New_York**.
+  Daylight-saving changes are handled automatically. Weekends count too.
+- A game counts by its **start time**, not its finish/detection time. A game that
+  starts at 4:59 PM counts even if still live at 5 PM; one starting at 8:59 AM does
+  not. All game modes count, with shared matches counted separately per player.
+- The existing one-minute Worker schedule posts a fresh **9–5 tracker** message
+  to `DISCORD_ALERT_CHANNEL_ID` on its first run at/after 5 PM Eastern, including
+  zero-game days. The bot authors it; no webhook or Codex heartbeat is involved.
+- Delivery IDs, retry nonces and the schedule are stored separately in
+  `bot_records`. Repeated checks do not repost an unchanged report. Late data
+  edits its original message; the last seven posted dates are revisited in a
+  round-robin (normally within seven minutes).
+- The first run establishes today's start date; installation does not flood the
+  channel with historical daily reports. Missed dates after activation are
+  caught up one per tick when service resumes. `MONITOR_ENABLED=false` also
+  pauses this feature.
+- Counts use saved monitor observations since enrollment, not an independent
+  historical Riot scan. Pauses, outages and unavailable Riot matches can leave
+  gaps; the card labels delayed data and partial tracking. Live counts are saved
+  even in completed-only alert mode without sending extra live alerts. The
+  additional live-count cache retains 14 days; existing game history is intact.
+- A private loopback Worker entrypoint gives daily delivery its own request
+  budget. Riot outages do not suppress the daily report: it uses saved counts
+  with a delayed-data warning. Missing/corrupt state fails closed, not as zeroes.
+
+`/monitor/status` exposes `nineToFive` with the timezone, posting time, first/next
+date, last sent date/time and a delivery-error flag (no credentials). No new
+secrets, database migrations, channel permissions or external scheduler are needed.
+Discord's nonce protects ambiguous retries only within its recent-nonce window;
+the persisted message ID prevents repeat creation once acknowledged.
 
 ## Local development
 
@@ -192,3 +293,70 @@ opinions of Riot Games or anyone officially involved in producing or managing
 Riot Games properties. Riot Games and all associated properties are trademarks
 or registered trademarks of Riot Games, Inc. The original code is MIT-licensed;
 Riot assets and data are not relicensed by this project.
+
+## Weekly summaries and LP gains
+
+- `/summary` shows the last seven days of saved monitor observations, with
+  `private:true` available. It respects your saved privacy preference and is
+  restricted to the configured tracking server.
+- `/weekly enable` opts the server into a recap **in the channel where you run
+  it**, every Monday at **16:00 UTC**. The first post is at the next scheduled
+  Monday, covering the preceding seven days. Manage Server or Administrator
+  permission is required. Ensure the bot can view that channel, send messages,
+  and embed links.
+- `/weekly status` shows the channel, next delivery time and last delivery status;
+  `/weekly disable` stops scheduled posts. Settings responses are private.
+  Recaps are disabled by default and also respect `MONITOR_ENABLED`.
+
+Summaries include each non-archived tracked player's observed W–L record,
+most games, best win rate (minimum five observed games), longest observed loss
+streak, and separate **Solo/Duo and Flex net LP changes**. Promotions and demotions
+are included in net ranked progress; Master/Grandmaster/Challenger use the same
+LP scale. Biggest-climber highlights require observations near both ends of the
+period; ties use roster order. Paused trackers are labeled; up to ten players
+are included. Games shared by tracked players count once per player.
+
+These summaries read existing D1 history and make **no Riot or OP.GG requests**.
+They do not reconstruct missing games or per-game LP. The match window uses game
+start times, includes the start and excludes the end. LP shows the exact first
+and last observation timestamps within that window. Insufficient history,
+missing ranked queues, ranked counter resets, or gaps exceeding 48 hours produce
+an unavailable LP value. New/resumed tracking starts a new comparison period;
+shorter or stale histories are labeled partial. Pauses and outages may leave
+match history incomplete. History retention can also limit the LP sample.
+
+Delivery uses the existing minute cron and a separate Worker invocation, with
+D1 leases and a durable attempt marker. Confirmed Discord 4xx failures retry
+with backoff (429 respects Retry-After). An ambiguous timeout, 5xx, or crash after
+starting delivery suppresses automatic resends to avoid duplicate posts; check
+`/weekly status` and use `/summary` if needed. After a prolonged outage, only the
+latest due week is posted. All recap messages suppress mentions. Existing match
+cursors, roster baselines and historical alerts are never modified by recaps.
+
+## Rank and LP graphs
+
+`/lpgraph summoner:Name#Tag days:7 queue:both` attaches separate Solo/Duo and Flex
+PNG graphs directly to the Discord response. `days` accepts 1–30 (default 7),
+`queue` accepts Both/Solo/Duo/Flex, and `private:true` keeps the response private.
+Your saved summoner and privacy defaults apply. The command uses the configured
+NA tracking roster, including retained history from paused or archived players.
+It does not require a new Riot request or upload history to a chart service.
+
+Each graph shows rank + LP, UTC dates/times, exact observations, net LP change,
+peak rank and latest observed rank. Promotions/demotions use a continuous ranked
+progress scale; Master/Grandmaster/Challenger share the same LP scale. Step lines
+connect nearby observations only. Missing queues, ranked counter resets,
+resumed tracking and gaps exceeding two hours break the line. A net change is
+not reported across those breaks. One observation appears as a dot, not a trend;
+no observations produce an explanatory card. Partial periods and stale latest
+observations are labeled, and the requested date range remains visible.
+
+**Historical backfill:** existing saved rank history is used automatically.
+Riot's [League-v4 and Match-v5 API schemas](https://developer.riotgames.com/apis)
+expose current ranked entries and match details, not dated historical LP in
+match results. OP.GG's public page can contain timestamped `lpHistories` snapshots,
+but the inspected payload did not identify their ranked queue. They are therefore
+not imported into either queue's graph. Partial cards link to the player's OP.GG
+page for inspection. Wins/losses, season-end ranks and undocumented server actions
+are not used to manufacture daily LP history. Current monitor retention is up to
+32 days and 500 observations per player, so busy accounts can have shorter coverage.

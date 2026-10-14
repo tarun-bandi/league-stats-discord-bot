@@ -4,9 +4,10 @@ import { trackingCommand, assertMonitorAdmin } from "../src/tracking.js";
 import { readState, trackerEntries, runLeagueMonitor, validateMonitorState, monitorStatus } from "../src/monitor.js";
 import { reportCredentialHealth } from "../src/health.js";
 import { readRecord } from "../src/store.js";
+import { workdayCount } from "../src/workday.js";
 import { testDb, stateFixture, tracker, envFixture, subcommand, game } from "./helpers/db.js";
 
-function mockMonitor(t, { current = "NA1_100", newAccount = "New", live = false, onRequest = () => {}, failDiscord = false, authFails = false } = {}) {
+function mockMonitor(t, { current = "NA1_100", newAccount = "New", live = false, liveStart = Date.now(), onRequest = () => {}, failDiscord = false, authFails = false } = {}) {
   t.mock.method(globalThis, "fetch", async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : input); onRequest(url, init);
     if (url.hostname === "discord.com") {
@@ -22,7 +23,7 @@ function mockMonitor(t, { current = "NA1_100", newAccount = "New", live = false,
     if (url.pathname.endsWith("/ids")) return Response.json(url.searchParams.get("count") === "1" ? [current] : current === "NA1_100" ? [current] : [current, "NA1_100"]);
     if (url.pathname.includes("active-games")) {
       const puuid = decodeURIComponent(url.pathname.split("/").at(-1));
-      return live ? Response.json({ gameId: 300, gameStartTime: Date.now(), gameQueueConfigId: 420, participants: [{ puuid, championId: 238 }] }) : new Response(null, { status: 404 });
+      return live ? Response.json({ gameId: 300, gameStartTime: liveStart, gameQueueConfigId: 420, participants: [{ puuid, championId: 238 }] }) : new Response(null, { status: 404 });
     }
     if (url.pathname.includes("league/v4")) return Response.json([{ queueType: "RANKED_SOLO_5x5", tier: "GOLD", rank: "II", wins: 10, losses: 10, leaguePoints: 30 }]);
     if (url.pathname.includes("/matches/")) {
@@ -105,6 +106,19 @@ test("a newly enrolled account without old matches reports its first completed g
   assert.equal((await readState(db)).riot_newest_completed_match_id, "NA1_100");
   assert.equal((await runLeagueMonitor(env)).newAlerts, 0);
   assert.equal(posts.length, 1);
+});
+
+test("9-5 counts a still-live game in completed-only mode without any live alert", async (t) => {
+  const state = stateFixture(); state.alert_mode = "completed";
+  const db = testDb(state); const env = envFixture(db); const posts = [];
+  const now = Date.parse("2026-10-13T21:00:00Z");
+  mockMonitor(t, { live: true, liveStart: now - 60_000, onRequest: (url, init) => { if (url.pathname.endsWith("/messages") && init.method === "POST") posts.push(init); } });
+  await runLeagueMonitor(env, { detectionTimestamp: now });
+  for (const { tracker } of trackerEntries(await readState(db))) {
+    assert.equal(workdayCount(tracker, "2026-10-13", now), 1);
+    assert.deepEqual(tracker.reported_games, {});
+  }
+  assert.equal(posts.length, 0);
 });
 
 test("archived live alerts drain by editing the original grouped message", async (t) => {

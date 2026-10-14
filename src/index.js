@@ -1,3 +1,8 @@
+import { lpGraphCommand, responseBody } from "./lp-graph.js";
+import { summaryCommand, weeklyCommand, assertRecapGuild, runWeeklyRecap } from "./recap.js";
+import { UserFacingError, RiotRateLimitError } from "./errors.js";
+import { cacheKey, cacheRead, cacheWrite, checkRiotCooldown, recordRiotCooldown } from "./data-cache.js";
+import { buildOpggResponse } from "./opgg.js";
 import {
   COMMANDS,
   MONITORED_SUMMONER_DEFAULTS,
@@ -15,6 +20,7 @@ import { getChampionCatalog, championInfo, championThumbnail, championAutocomple
 import { riotKeyFingerprint } from "./riot-key.js";
 import { readProfile, withDefaults, commandOptions, optionsObject } from "./preferences.js";
 import { createLookup, updateLookup, resolveView, championModal, profileCommand, featureMessage } from "./features.js";
+import { createSocial, updateSocial, resolveSocial } from "./social.js";
 import { trackingCommand, assertMonitorAdmin } from "./tracking.js";
 import { readRecord, purgeExpiredRecords } from "./store.js";
 import { nineToFiveCommand, nineToFiveStatus, runNineToFive } from "./nine-to-five.js";
@@ -43,7 +49,7 @@ const REGIONS = {
   vn: { platform: "vn2", regional: "sea", label: "VN" },
 };
 
-export class UserFacingError extends Error {}
+export { UserFacingError } from "./errors.js";
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -100,8 +106,8 @@ export async function autocompleteResponse(interaction, env) {
     return json({ type: 8, data: { choices: championAutocompleteChoices(catalog, focused.value) } });
   }
   if (
-    focused?.name !== "summoner" ||
-    !["stats", "recent", "live", "session", "profile", "track", "9-5"].includes(interaction.data?.name)
+    !["summoner", "opponent"].includes(focused?.name) ||
+    !["stats", "recent", "live", "session", "profile", "track", "compare", "leaderboard", "lpgraph", "9-5"].includes(interaction.data?.name)
   ) {
     return json({ type: 8, data: { choices: [] } });
   }
@@ -191,7 +197,7 @@ function optionValue(interaction, name, fallback) {
   );
 }
 
-function getRegion(interaction) {
+export function getRegion(interaction) {
   const key = String(optionValue(interaction, "region", "na")).toLowerCase();
   const region = REGIONS[key];
   if (!region) {
@@ -200,7 +206,7 @@ function getRegion(interaction) {
   return region;
 }
 
-function getMode(interaction) {
+export function getMode(interaction) {
   const value = Number(optionValue(interaction, "mode", 0));
   if (!MODE_CHOICES.some((mode) => mode.value === value)) {
     throw new UserFacingError("Choose a supported game mode from the mode option.");
@@ -208,7 +214,7 @@ function getMode(interaction) {
   return value;
 }
 
-async function cachedJson(url, init, ttlSeconds, cacheScope = "") {
+async function cachedJson(url, init, ttlSeconds, cacheScope = "", env = null) {
   const cache = globalThis.caches?.default;
   const cacheUrl = new URL(url);
   if (cacheScope) cacheUrl.searchParams.set("__leaguestats_credential", cacheScope);
@@ -218,7 +224,9 @@ async function cachedJson(url, init, ttlSeconds, cacheScope = "") {
     if (cached) return cached.json();
   }
 
+  if (env) await checkRiotCooldown(env, url);
   const response = await fetch(url, init);
+  if (env && response.status === 429) throw await recordRiotCooldown(env, url, response.headers.get("Retry-After"));
   if (!response.ok) {
     const error = new Error(`HTTP ${response.status}`);
     error.status = response.status;
@@ -249,6 +257,7 @@ async function riotJson(env, url, ttlSeconds = 0) {
       { headers: { "X-Riot-Token": env.RIOT_API_KEY } },
       ttlSeconds,
       ttlSeconds > 0 ? await riotKeyFingerprint(env.RIOT_API_KEY) : "",
+      env,
     );
   } catch (error) {
     if (error instanceof UserFacingError) throw error;
@@ -267,7 +276,7 @@ async function riotJson(env, url, ttlSeconds = 0) {
   }
 }
 
-async function resolveAccount(env, riotId, region) {
+export async function resolveAccount(env, riotId, region) {
   const url = `https://${region.regional}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(riotId.gameName)}/${encodeURIComponent(riotId.tagLine)}`;
   return riotJson(env, url, 3600);
 }
@@ -300,11 +309,27 @@ async function getMatch(env, matchId, region) {
   return riotJson(env, url);
 }
 
-async function getMatches(env, matchIds, region) {
+async function getMatches(env, matchIds, region, puuid) {
+  const scope = await cacheKey("match-scope", [env.RIOT_API_KEY, region.regional, puuid]);
+  const cachedMatch = async (id) => {
+    const key = `${scope}:${id}`;
+    const cached = await cacheRead(env, key);
+    if (cached?.metadata?.matchId === id && participantFor(cached, puuid)) return cached;
+    const raw = await getMatch(env, id, region);
+    if (participantFor(raw, puuid)) {
+      const compact = compactMatches([raw], puuid)[0];
+      await cacheWrite(env, key, compact, 7 * 86400_000);
+      return compact;
+    }
+    return raw;
+  };
   const matches = [];
   for (let index = 0; index < matchIds.length; index += 10) {
     const chunk = matchIds.slice(index, index + 10);
-    matches.push(...(await Promise.all(chunk.map((id) => getMatch(env, id, region)))));
+    const settled = await Promise.allSettled(chunk.map(cachedMatch));
+    const failed = settled.find((result) => result.status === "rejected");
+    if (failed) throw failed.reason;
+    matches.push(...settled.map((result) => result.value));
     if (index + 10 < matchIds.length) {
       await new Promise((resolve) => setTimeout(resolve, 650));
     }
@@ -330,7 +355,7 @@ export async function loadMoreMatches(interaction, env, snapshot, count = 30) {
   const ids = await getMatchIds(env, snapshot.account.puuid, region, { count, start: snapshot.offset,
     startTime: snapshot.startTime, endTime: snapshot.endTime, queue: getMode(interaction) });
   const seen = new Set(snapshot.matches.map((match) => match.metadata.matchId));
-  const matches = await getMatches(env, [...new Set(ids)].filter((id) => !seen.has(id)), region);
+  const matches = await getMatches(env, [...new Set(ids)].filter((id) => !seen.has(id)), region, snapshot.account.puuid);
   snapshot.matches.push(...compactMatches(matches, snapshot.account.puuid));
   snapshot.offset += ids.length;
   snapshot.more = ids.length === count;
@@ -503,7 +528,7 @@ export async function buildStatsResponse(interaction, env, snapshot = null) {
     }),
     getRankedEntries(env, account.puuid, region),
   ]);
-  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region);
+  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region, account.puuid);
   if (snapshot && !snapshot.matches) Object.assign(snapshot, { account, startTime, endTime, rankedEntries,
     matches: compactMatches(matches, account.puuid), offset: matchIds.length, more: matchIds.length === MAX_STATS_MATCHES });
   const selectedMatches = champion ? matches.filter((match) => {
@@ -575,7 +600,7 @@ export async function buildRecentResponse(interaction, env, snapshot = null) {
   const account = snapshot?.account ?? await resolveAccount(env, riotId, region);
   const endTime = snapshot?.endTime ?? Math.floor(Date.now() / 1000);
   const matchIds = snapshot?.matches ? snapshot.matches.map((match) => match.metadata.matchId) : await getMatchIds(env, account.puuid, region, { count, queue: mode, endTime });
-  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region);
+  const matches = snapshot?.matches ?? await getMatches(env, matchIds, region, account.puuid);
   if (snapshot && !snapshot.matches) Object.assign(snapshot, { account, endTime, matches: compactMatches(matches, account.puuid), offset: matchIds.length, more: matchIds.length === count });
   const page = snapshot?.page ?? 0;
   const allRows = aggregateMatches(matches, account.puuid, 1);
@@ -673,7 +698,7 @@ function helpResponse() {
           {
             name: "Commands",
             value:
-              "`/stats` — champion stats, period buttons and cached load-more\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/9-5` — tracked players' 9 AM–5 PM Eastern game counts; daily channel report after 5 PM\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
+              "`/stats` — champion stats, period buttons and cached load-more\n`/leaderboard` — automatically rank up to 10 active tracked players\n`/compare` — two players, same period and mode\n`/summary` — weekly highlights and observed LP gains\n`/lpgraph` — rank and LP history charts\n`/weekly enable/disable/status` — Monday recap delivery\n`/recent` — paginated recent games\n`/session` — today's record, time played and observed LP\n`/9-5` — 9 AM–5 PM Eastern counts; daily report after 5 PM\n`/live` — current game\n`/profile set/show/clear` — your account, mode, region and privacy defaults\n`/track` — admin roster, alert mode and credential-notification owner\n`/ping` — bot health",
             inline: false,
           },
           {
@@ -698,28 +723,44 @@ async function editOriginalResponse(interaction, payload) {
   const url = `${DISCORD_API}/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`;
   const response = await fetch(url, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    ...responseBody(payload),
   });
   if (!response.ok) {
     throw new Error(`Discord follow-up failed with HTTP ${response.status}`);
   }
 }
 
-async function runDeferredCommand(interaction, env) {
+async function runDeferredCommand(interaction, env, context) {
   try {
     let payload;
     switch (interaction.data?.name) {
       case "stats":
       case "recent":
       case "session":
-        payload = await createLookup(interaction, env);
+        try { payload = await createLookup(interaction, env); }
+        catch (error) {
+          if (!(error instanceof RiotRateLimitError)) throw error;
+          payload = await buildOpggResponse(interaction, env);
+        }
+        break;
+      case "compare":
+      case "leaderboard":
+        payload = await createSocial(interaction, env, context?.exports?.LeaderboardPlayer);
         break;
       case "live":
         payload = await buildLiveResponse(interaction, env);
         break;
       case "profile":
         payload = await profileCommand(interaction, env);
+        break;
+      case "lpgraph":
+        payload = await lpGraphCommand(interaction, env);
+        break;
+      case "summary":
+        payload = await summaryCommand(interaction, env);
+        break;
+      case "weekly":
+        payload = await weeklyCommand(interaction, env);
         break;
       case "track":
         payload = featureMessage(await trackingCommand(interaction, env));
@@ -755,8 +796,8 @@ async function runDeferredCommand(interaction, env) {
   }
 }
 
-async function runComponent(interaction, env) {
-  try { await editOriginalResponse(interaction, await updateLookup(interaction, env)); }
+async function runComponent(interaction, env, context) {
+  try { await editOriginalResponse(interaction, (String(interaction.data.custom_id).startsWith("social:") ? await updateSocial(interaction, env, context?.exports?.LeaderboardPlayer) : await updateLookup(interaction, env))); }
   catch (error) {
     // A failed click must not replace a good public card with an error.
     const content = error instanceof UserFacingError ? error.message : "This card could not be updated. Try again shortly.";
@@ -768,18 +809,19 @@ async function runComponent(interaction, env) {
 }
 
 export default {
-  async scheduled(controller, env) {
+  async scheduled(controller, env, context) {
     // The report still surfaces (with a delayed-data warning) during a Riot
     // outage or a busy monitor. It never writes the authoritative game state.
     const results = await Promise.allSettled([
       runLeagueMonitor(env, { detectionTimestamp: controller.scheduledTime || Date.now() }),
-      runNineToFive(env),
+      context?.exports?.NineToFive ? context.exports.NineToFive.run() : runNineToFive(env),
+      context?.exports?.WeeklyRecap ? context.exports.WeeklyRecap.run(controller.scheduledTime || Date.now()) : runWeeklyRecap(env, controller.scheduledTime || Date.now()),
     ]);
     for (const [index, result] of results.entries()) {
-      if (result.status === "rejected") console.error(index === 0 ? "League Game Monitor failed" : "9–5 tracker failed", result.reason instanceof Error ? result.reason.message : String(result.reason));
+      if (result.status === "rejected") console.error(["League Game Monitor failed", "9–5 tracker failed", "Weekly recap failed"][index], result.reason instanceof Error ? result.reason.message : String(result.reason));
     }
     if (monitorEnabled(env) && env.MONITOR_DB && new Date(controller.scheduledTime || Date.now()).getUTCMinutes() === 0) await purgeExpiredRecords(env.MONITOR_DB);
-    const failure = results.find((result) => result.status === "rejected");
+    const failure = results.slice(0, 2).find((result) => result.status === "rejected");
     if (failure) throw failure.reason;
   },
 
@@ -845,10 +887,15 @@ export default {
 
     if ([3, 5].includes(interaction.type)) {
       try {
+        if (String(interaction.data.custom_id).startsWith("social:") && interaction.type === 3) {
+          await resolveSocial(interaction, env);
+          context.waitUntil(runComponent(interaction, env, context));
+          return json({ type: 6 });
+        }
         const { view, action } = await resolveView(interaction, env);
         if (action === "champion" && interaction.type === 3) return json(championModal(view));
         if (interaction.type === 5 && action !== "choose") throw new UserFacingError("Unknown form.");
-        context.waitUntil(runComponent(interaction, env));
+        context.waitUntil(runComponent(interaction, env, context));
         return json({ type: 6 });
       } catch (error) {
         return immediateMessage(error instanceof UserFacingError ? error.message : "This card is temporarily unavailable.", { ephemeral: true });
@@ -867,17 +914,18 @@ export default {
       return json({ type: 4, data: helpResponse() });
     }
 
-    if (["stats", "recent", "live", "session", "profile", "track", "9-5"].includes(interaction.data?.name)) {
+    if (["stats", "recent", "live", "session", "profile", "track", "compare", "leaderboard", "summary", "weekly", "lpgraph", "9-5"].includes(interaction.data?.name)) {
       try {
-        const administrative = ["profile", "track"].includes(interaction.data.name);
-        if (interaction.data.name === "track") assertMonitorAdmin(interaction, env);
+        const administrative = ["profile", "track", "weekly"].includes(interaction.data.name);
+        if (["track", "weekly"].includes(interaction.data.name)) assertMonitorAdmin(interaction, env);
+        if (["summary", "lpgraph", "9-5"].includes(interaction.data.name)) assertRecapGuild(interaction, env);
         // Read preferences before acknowledging so a private default can never
         // accidentally be posted publicly. Storage failure is fail-closed.
         const profile = administrative ? {} : await readProfile(interaction, env);
         // /9-5 defaults to everyone, not the user's saved summoner/region/zone.
         const effective = administrative ? interaction : withDefaults(interaction, interaction.data.name === "9-5" ? { private: profile.private ?? false } : profile);
-        if (!administrative && interaction.data.name !== "9-5" && !optionsObject(effective).summoner) return immediateMessage("Choose a summoner or save one with `/profile set summoner:...`.", { ephemeral: true });
-        context.waitUntil(runDeferredCommand(effective, env));
+        if (!administrative && !["leaderboard", "summary", "9-5"].includes(interaction.data.name) && !optionsObject(effective).summoner) return immediateMessage("Choose a summoner or save one with `/profile set summoner:...`.", { ephemeral: true });
+        context.waitUntil(runDeferredCommand(effective, env, context));
         return deferredMessage(administrative || Boolean(optionsObject(effective).private));
       } catch (error) {
         return immediateMessage(error instanceof UserFacingError ? error.message : "Your settings could not be loaded. Nothing was posted publicly; try again shortly.", { ephemeral: true });

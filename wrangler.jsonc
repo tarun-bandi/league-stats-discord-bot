@@ -1,7 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "discord-interactions-bot",
-  "main": "src/index.js",
+  "main": "src/worker.js",
+  "compatibility_flags": ["enable_ctx_exports"],
   "compatibility_date": "2026-08-23",
   "vars": {
     "DISCORD_APPLICATION_ID": "777218985527083008",

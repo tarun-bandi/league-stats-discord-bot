@@ -3,7 +3,8 @@ import { readRecord, writeRecord, leaseRecord, releaseRecord } from "./store.js"
 import { brandedEmbed } from "./branding.js";
 import { easternParts, shiftDate, workdayWindow, workdayCount, WORKDAY_ZONE } from "./workday.js";
 import { optionsObject } from "./preferences.js";
-import { UserFacingError } from "./index.js";
+import { UserFacingError } from "./errors.js";
+import { retryAt } from "./data-cache.js";
 
 const JOB_KEY = "nine-to-five:schedule";
 const dayKey = (date) => `nine-to-five:day:${date}`;
@@ -88,7 +89,15 @@ async function deliverDay(env, state, date, now, fetchImpl) {
     body: JSON.stringify({ ...payload, ...(!saved.messageId ? { nonce: saved.nonce, enforce_nonce: true } : {}) }),
     signal: AbortSignal.timeout(15_000),
   });
-  if (!response.ok) throw new Error(`9–5 Discord delivery failed (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(`9–5 Discord delivery failed (${response.status})`);
+    if (response.status === 429) {
+      let seconds = 0;
+      try { seconds = Number((await response.json()).retry_after) || 0; } catch { /* Header fallback below. */ }
+      error.retryAt = Math.max(now + 60_000, now + seconds * 1000, retryAt(response.headers.get("Retry-After"), now));
+    }
+    throw error;
+  }
   const message = await response.json();
   if (!/^\d+$/.test(String(message.id ?? ""))) throw new Error("9–5 delivery returned no message ID");
   Object.assign(saved, { messageId: String(message.id), signature, roster: rows.map((row) => row.stateKey), updatedAt: new Date(now).toISOString() });
@@ -108,6 +117,7 @@ export async function runNineToFive(env, { now = Date.now(), fetchImpl = fetch }
   if (!await leaseRecord(env.MONITOR_DB, JOB_KEY, owner)) return { status: "busy" };
   try {
     const job = await readRecord(env.MONITOR_DB, JOB_KEY);
+    if (now < (job.retryAt ?? 0)) return { status: "backoff" };
     try {
       let changed = 0;
       // One overdue report per tick: recover missed days without a channel burst.
@@ -127,10 +137,12 @@ export async function runNineToFive(env, { now = Date.now(), fetchImpl = fetch }
         job.reconcileOffset = ((job.reconcileOffset ?? 0) + 1) % 7;
       }
       delete job.deliveryError;
+      delete job.retryAt;
       await writeRecord(env.MONITOR_DB, JOB_KEY, job);
       return { status: "ok", changed };
     } catch (error) {
       job.deliveryError = true;
+      if (error.retryAt) job.retryAt = error.retryAt;
       await writeRecord(env.MONITOR_DB, JOB_KEY, job);
       throw error;
     }
