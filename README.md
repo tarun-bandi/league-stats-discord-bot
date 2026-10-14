@@ -25,6 +25,7 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 - Owner-only interactive cards, recent pagination and cached history up to 300 games
 - Session summaries with time played and observed (not reconstructed) LP changes
 - One-time credential-failure/recovery notifications to the configured owner
+- `/9-5` game-count leaderboard and an automatic daily report after 5 PM Eastern
 
 ## Try it
 
@@ -37,6 +38,8 @@ Cloudflare Worker for League of Legends Discord slash commands and a one-minute 
 /profile set summoner:TIXBS Chaos#NA1 mode:Ranked Solo/Duo
 /stats champion:Xerath private:true
 /session
+/9-5
+/9-5 summoner:HelloThere#9494 private:true
 ```
 
 Select `summoner` to see the three monitored accounts. Any valid Riot ID still
@@ -126,6 +129,44 @@ cached backoff, without browser challenges or private API access. Source:
 The production Cron Trigger is `* * * * *`. The monitor does not access D1,
 Riot, or Discord while `MONITOR_ENABLED` is false. When enabled, it refuses to
 access Riot or Discord if its D1 state is missing, corrupt, or invalid.
+
+## 9–5 tracker
+
+`/9-5` shows today's counts for the tracked roster, highest count first. Select
+`summoner` to show one tracked player. It honors your private-response preference,
+but deliberately ignores saved summoner, mode and timezone defaults for the
+roster-wide report. It is available in the configured tracking server.
+
+- Window: **9:00 AM inclusive to 5:00 PM exclusive, America/New_York**.
+  Daylight-saving changes are handled automatically. Weekends count too.
+- A game counts by its **start time**, not its finish/detection time. A game that
+  starts at 4:59 PM counts even if still live at 5 PM; one starting at 8:59 AM does
+  not. All game modes count, with shared matches counted separately per player.
+- The existing one-minute Worker schedule posts a fresh **9–5 tracker** message
+  to `DISCORD_ALERT_CHANNEL_ID` on its first run at/after 5 PM Eastern, including
+  zero-game days. The bot authors it; no webhook or Codex heartbeat is involved.
+- Delivery IDs, retry nonces and the schedule are stored separately in
+  `bot_records`. Repeated checks do not repost an unchanged report. Late data
+  edits its original message; the last seven posted dates are revisited in a
+  round-robin (normally within seven minutes).
+- The first run establishes today's start date; installation does not flood the
+  channel with historical daily reports. Missed dates after activation are
+  caught up one per tick when service resumes. `MONITOR_ENABLED=false` also
+  pauses this feature.
+- Counts use saved monitor observations since enrollment, not an independent
+  historical Riot scan. Pauses, outages and unavailable Riot matches can leave
+  gaps; the card labels delayed data and partial tracking. Live counts are saved
+  even in completed-only alert mode without sending extra live alerts. The
+  additional live-count cache retains 14 days; existing game history is intact.
+- A private loopback Worker entrypoint gives daily delivery its own request
+  budget. Riot outages do not suppress the daily report: it uses saved counts
+  with a delayed-data warning. Missing/corrupt state fails closed, not as zeroes.
+
+`/monitor/status` exposes `nineToFive` with the timezone, posting time, first/next
+date, last sent date/time and a delivery-error flag (no credentials). No new
+secrets, database migrations, channel permissions or external scheduler are needed.
+Discord's nonce protects ambiguous retries only within its recent-nonce window;
+the persisted message ID prevents repeat creation once acknowledged.
 
 ## Local development
 

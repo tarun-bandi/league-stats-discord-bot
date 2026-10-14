@@ -6,6 +6,7 @@ import { syncDiscordApplication } from "./application.js";
 import { getChampionCatalog, championInfo } from "./champions.js";
 import { riotKeyFingerprint } from "./riot-key.js";
 import { reportCredentialHealth, confirmCredentialFailure } from "./health.js";
+import { rememberWorkdayGame } from "./workday.js";
 
 const STATE_KEY = "league-game-monitor";
 const DISCORD_API = "https://discord.com/api/v10";
@@ -847,17 +848,20 @@ async function observeTracker(env, tracker, stateKey, detectionMs, names, keyFin
     if (game.patch_message_id) patchTargets.set(String(game.patch_message_id), { messageId: String(game.patch_message_id), channelId: game.patch_channel_id });
   };
   for (const game of await reconcilePendingLiveGames(env, tracker, detectionIso)) {
+    rememberWorkdayGame(tracker, game.record, detectionMs);
     game.record.champion_icon_url = championInfo(names, game.record.champion_id ?? game.record.champion)?.icon ?? game.record.champion_icon_url;
     addPatch(game);
   }
   if (tracker.monitor_paused || tracker.removed_at) return { newAlerts, patchTargets };
   const completed = await completedUpdates(env, tracker, detectionIso);
   for (const game of completed) {
+    rememberWorkdayGame(tracker, game, detectionMs);
     if (game.record) game.record.champion_icon_url = championInfo(names, game.champion_id ?? game.champion)?.icon ?? game.record.champion_icon_url;
     if (game.is_new_alert) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: game.record });
     addPatch(game);
   }
   const live = await activeGame(env, tracker, detectionIso, names);
+  rememberWorkdayGame(tracker, live, detectionMs);
   tracker.newest_live_game_id = live?.live_game_id ?? null;
   const newLive = alertMode === "completed" ? null : addLiveUpdate(tracker, live);
   if (newLive) newAlerts.push({ stateKey, riotId: tracker.summoner.riot_id, record: newLive.record });
