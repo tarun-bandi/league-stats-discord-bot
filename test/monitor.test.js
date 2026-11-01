@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { testDb } from "./helpers/db.js";
 
 import {
   commitMonitorChanges,
+  acquireLease,
   monitorConfiguration,
   findCorrelatedLiveRecord,
   monitorPayload,
@@ -282,9 +284,11 @@ test("commitMonitorChanges persists the returned bot message ID", async () => {
   const alert = completedAlert();
   state.reported_games.game = alert.record;
   let savedState;
+  const db = testDb(state);
+  await acquireLease(db, Date.now(), "test-owner");
 
   await commitMonitorChanges(
-    { ...botEnv, MONITOR_DB: {} },
+    { ...botEnv, MONITOR_DB: db },
     {
       state,
       owner: "test-owner",
@@ -326,9 +330,11 @@ test("commitMonitorChanges rebuilds every record in a grouped bot message", asyn
   state.reported_games.first = first;
   state.additional_summoners["na:tixbs chaos#na1"].reported_games.second = second;
   const calls = [];
+  const db = testDb(state);
+  await acquireLease(db, Date.now(), "test-owner");
 
   await commitMonitorChanges(
-    { ...botEnv, MONITOR_DB: {} },
+    { ...botEnv, MONITOR_DB: db },
     {
       state,
       owner: "test-owner",
@@ -419,10 +425,12 @@ test("Discord delivery failure does not save monitor state", async () => {
   const state = validState();
   const alert = completedAlert();
   state.reported_games.game = alert.record;
+  const db = testDb(state);
+  await acquireLease(db, Date.now(), "test-owner");
 
   await assert.rejects(
     commitMonitorChanges(
-      { ...botEnv, MONITOR_DB: {} },
+      { ...botEnv, MONITOR_DB: db },
       {
         state,
         owner: "test-owner",

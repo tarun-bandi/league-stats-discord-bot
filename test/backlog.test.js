@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { observeRanks, rankScore } from "../src/ranks.js";
 import { queueName, matchMetrics, metricsSummary, MODE_CHOICES } from "../src/league.js";
 import { buildStatsResponse, buildRecentResponse } from "../src/index.js";
-import { completedGame, commitMonitorChanges, monitorPayload, runLeagueMonitor, reconcilePendingLiveGames } from "../src/monitor.js";
+import { acquireLease, completedGame, commitMonitorChanges, monitorPayload, runLeagueMonitor, reconcilePendingLiveGames, readState } from "../src/monitor.js";
+import { testDb } from "./helpers/db.js";
 import { syncDiscordApplication } from "../src/application.js";
 import { catalogFromData, championInfo, championThumbnail, getChampionCatalog } from "../src/champions.js";
 
@@ -86,7 +87,9 @@ test("demotion and game records survive grouped message rebuild and ID persisten
   const game = completedGame({ metadata: { matchId: "NA1_1" }, info: { gameStartTimestamp: Date.parse(at), gameDuration: 1800, queueId: 2400, participants: [{ puuid: "x", championName: "Lux", win: true, kills: 2, deaths: 3, assists: 20 }] } }, { summoner: { puuid: "x" } }, later);
   const state = { ...rankTracker, summoner: { riot_id: "Test#NA1" }, reported_games: { game }, additional_summoners: {} };
   const items = [{ riotId: "Test#NA1", record }, { riotId: "Test#NA1", record: game }];
-  const env = { DISCORD_BOT_TOKEN: "test", DISCORD_ALERT_CHANNEL_ID: "123" };
+  const db = testDb(state);
+  await acquireLease(db, Date.now(), "test");
+  const env = { MONITOR_DB: db, DISCORD_BOT_TOKEN: "test", DISCORD_ALERT_CHANNEL_ID: "123" };
   const options = { state, owner: "test", detectionIso: later, newAlerts: items, patchTargets: new Map() };
   await commitMonitorChanges(env, options, { fetchImpl: async () => Response.json({ id: "42" }), saveStateImpl: async () => {} });
   assert.equal(record.discord_message_id, "42");
@@ -173,10 +176,10 @@ test("30-game stats plus champion catalog fit the Worker free subrequest budget"
 });
 
 test("full monitor Discord failure preserves stored rank baseline and game history", async (t) => {
+  t.mock.method(Date, "now", () => Date.parse(later));
   const tracker = (name) => ({ ...baseline(), summoner: { riot_id: `${name}#NA1`, puuid: name, riot_account_checked_at: at }, baseline: {}, newest_completed_match: null, riot_newest_completed_match_id: "NA1_old", reported_games: { old: { status: "completed", discord_message_id: "old-message" } } });
-  let stored = JSON.stringify({ ...tracker("A"), additional_summoners: { b: tracker("B"), c: tracker("C") } });
-  const original = stored;
-  const db = { prepare(sql) { return { bind(...args) { return { first: async () => ({ state_json: stored }), run: async () => { if (sql.includes("SET state_json")) stored = args[0]; return { meta: { changes: 1 } }; } }; } }; } };
+  const original = { ...tracker("A"), additional_summoners: { b: tracker("B"), c: tracker("C") } };
+  const db = testDb(original);
   t.mock.method(globalThis, "fetch", async (input) => {
     const url = String(input instanceof Request ? input.url : input);
     if (url.includes("discord.com")) return new Response(null, { status: 500 });
@@ -192,5 +195,5 @@ test("full monitor Discord failure preserves stored rank baseline and game histo
     throw new Error("Unexpected request");
   });
   await assert.rejects(runLeagueMonitor({ MONITOR_ENABLED: "true", MONITOR_DB: db, RIOT_API_KEY: "test", DISCORD_BOT_TOKEN: "test", DISCORD_ALERT_CHANNEL_ID: "123" }, { detectionTimestamp: Date.parse(later) }), /Discord bot POST failed/);
-  assert.equal(stored, original);
+  assert.deepEqual(await readState(db), original);
 });
