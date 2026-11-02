@@ -8,6 +8,7 @@ import { riotKeyFingerprint } from "./riot-key.js";
 import { reportCredentialHealth, confirmCredentialFailure } from "./health.js";
 import { rememberWorkdayGame } from "./workday.js";
 import { RiotRateLimitError } from "./errors.js";
+import { readMonitorDelivery, prepareMonitorDelivery, saveMonitorDelivery, clearMonitorDelivery, monitorDeliveryStatus, renewMonitorDeliveryLease, monitorDeliveryNonce } from "./monitor-delivery.js";
 
 const STATE_KEY = "league-game-monitor";
 const DISCORD_API = "https://discord.com/api/v10";
@@ -602,9 +603,12 @@ export function monitorPayload(items) {
 }
 
 async function discordRequest(fetchImpl, url, init, action) {
-  const response = await fetchImpl(url, init);
+  const response = await fetchImpl(url, { ...init, signal: AbortSignal.timeout(15_000) });
   if (!response.ok) {
-    throw new Error(`Discord ${action} failed with HTTP ${response.status}`);
+    const error = new Error(`Discord ${action} failed with HTTP ${response.status}`);
+    error.discordStatus = response.status;
+    try { error.discordCode = (await response.json()).code; } catch { /* No JSON error body. */ }
+    throw error;
   }
   return response;
 }
@@ -616,7 +620,7 @@ function botHeaders(env) {
   };
 }
 
-export async function postDiscordBot(env, items, fetchImpl = fetch) {
+export async function postDiscordBot(env, items, fetchImpl = fetch, nonce) {
   const channelId = botChannelId(env);
   const response = await discordRequest(
     fetchImpl,
@@ -624,7 +628,7 @@ export async function postDiscordBot(env, items, fetchImpl = fetch) {
     {
       method: "POST",
       headers: botHeaders(env),
-      body: JSON.stringify(monitorPayload(items)),
+      body: JSON.stringify({ ...monitorPayload(items), ...(nonce ? { nonce, enforce_nonce: true } : {}) }),
     },
     "bot POST",
   );
@@ -782,13 +786,91 @@ export async function saveState(db, owner, state, detectionIso) {
   }
 }
 
+function deliveryItems(state, newAlerts) {
+  return newAlerts.map((alert) => {
+    const entry = trackerEntries(state).find(({ stateKey, tracker }) =>
+      (!alert.stateKey || alert.stateKey === stateKey) &&
+      Object.values(alert.record.kind === "demotion" ? tracker.reported_rank_changes ?? {} : tracker.reported_games).includes(alert.record));
+    if (!entry) throw new Error("New monitor alert is detached from its saved tracker");
+    const collection = alert.record.kind === "demotion" ? "reported_rank_changes" : "reported_games";
+    const recordKey = Object.keys(entry.tracker[collection]).find((key) => entry.tracker[collection][key] === alert.record);
+    return { stateKey: entry.stateKey, collection, recordKey, record: structuredClone(alert.record),
+      ...(collection === "reported_rank_changes" ? { rankState: {
+        rank_snapshot: entry.tracker.rank_snapshot, rank_checked_at: entry.tracker.rank_checked_at,
+        rank_history: entry.tracker.rank_history,
+      } } : {}) };
+  });
+}
+
+export async function recoverMonitorDelivery(db, owner, state) {
+  const delivery = await readMonitorDelivery(db);
+  if (!delivery) return;
+  if (delivery.status !== "sent" || !delivery.messageId || !delivery.items?.length) {
+    throw new Error("Monitor delivery outcome is uncertain; automatic resend blocked. Reconcile monitor:delivery before resuming.");
+  }
+  for (const item of delivery.items) {
+    const tracker = trackerEntries(state).find((entry) => entry.stateKey === item.stateKey)?.tracker;
+    if (!tracker || !["reported_games", "reported_rank_changes"].includes(item.collection)) throw new Error("Monitor delivery tracker is missing or invalid");
+    tracker[item.collection] ??= {};
+    const existing = tracker[item.collection][item.recordKey];
+    if (existing?.discord_message_id && String(existing.discord_message_id) !== delivery.messageId) throw new Error("Monitor delivery message ID conflicts with saved history");
+    // Restore only the delivered records, not an old roster/cursor snapshot.
+    // Preserve newer completion details and admin pause/archive/baseline changes.
+    const record = existing ?? (tracker[item.collection][item.recordKey] = structuredClone(item.record));
+    Object.assign(record, { discord_message_id: delivery.messageId, discord_channel_id: delivery.channelId, discord_transport: "bot" });
+    if (item.rankState && Date.parse(item.rankState.rank_checked_at) > Date.parse(tracker.rank_checked_at ?? "1970-01-01") &&
+        Date.parse(item.rankState.rank_checked_at) >= Date.parse(tracker.monitor_started_at ?? "1970-01-01")) {
+      Object.assign(tracker, item.rankState);
+    }
+  }
+  // Checkpoint before observing more games or replacing the receipt. Retain the
+  // lease and last_check_at: restoring a send is not a successful source check.
+  const result = await db.prepare("UPDATE monitor_state SET state_json=?1, updated_at=?2 WHERE state_key=?3 AND lease_owner=?4 AND lease_until>?5")
+    .bind(JSON.stringify(state), new Date().toISOString(), STATE_KEY, owner, Date.now()).run();
+  if (result.meta?.changes !== 1) throw new Error("Monitor delivery recovery lost its lease");
+  await clearMonitorDelivery(db, owner, delivery.nonce);
+}
+
 export async function commitMonitorChanges(
   env,
   { state, owner, detectionIso, newAlerts, patchTargets },
   { fetchImpl = fetch, saveStateImpl = saveState } = {},
 ) {
+  // Validate everything and do repeatable edits before the non-repeatable POST.
+  const items = deliveryItems(state, newAlerts);
+  if (newAlerts.length) monitorPayload(newAlerts);
+  const patches = [...patchTargets.values()].map((target) => {
+    const records = recordsForMessage(state, target.messageId);
+    monitorPayload(records);
+    return { ...target, records };
+  });
+  if (newAlerts.length || patches.length) await renewMonitorDeliveryLease(env.MONITOR_DB, owner);
+  for (const target of patches) {
+    if (target.records.every(({ record }) => record.discord_message_deleted_at)) continue;
+    try {
+      await patchDiscordBot(env, target.messageId, target.records, target.channelId, fetchImpl);
+    } catch (error) {
+      // A deleted message cannot be edited. Keep its dedupe history and never
+      // recreate it; missing channels/permissions and other failures still fail.
+      if (error.discordStatus !== 404 || error.discordCode !== 10008) throw error;
+      for (const { record } of target.records) record.discord_message_deleted_at = detectionIso;
+    }
+  }
   if (newAlerts.length) {
-    const messageId = await postDiscordBot(env, newAlerts, fetchImpl);
+    const channelId = botChannelId(env);
+    const delivery = { status: "sending", nonce: await monitorDeliveryNonce(channelId, items),
+      channelId, attemptedAt: detectionIso, items };
+    await prepareMonitorDelivery(env.MONITOR_DB, owner, delivery);
+    let messageId;
+    try { messageId = await postDiscordBot(env, newAlerts, fetchImpl, delivery.nonce); }
+    catch (error) {
+      // Only explicit rejections are safe to retry. Timeouts, 5xx, malformed
+      // success responses, or a crash leave the non-expiring attempt marker.
+      if (error.discordStatus >= 400 && error.discordStatus < 500) await clearMonitorDelivery(env.MONITOR_DB, owner, delivery.nonce);
+      throw error;
+    }
+    Object.assign(delivery, { status: "sent", messageId });
+    await saveMonitorDelivery(env.MONITOR_DB, owner, delivery);
     for (const alert of newAlerts) {
       alert.record.discord_message_id = messageId;
       alert.record.discord_transport = "bot";
@@ -798,19 +880,11 @@ export async function commitMonitorChanges(
     state.discord.last_message_id = messageId;
   }
 
-  for (const target of patchTargets.values()) {
-    await patchDiscordBot(
-      env,
-      target.messageId,
-      recordsForMessage(state, target.messageId),
-      target.channelId,
-      fetchImpl,
-    );
-  }
-
   state.last_check_at = detectionIso;
   state.monitor_runtime = "cloudflare-worker-cron";
   await saveStateImpl(env.MONITOR_DB, owner, state, detectionIso);
+  // Do not delete the receipt here: saveState releases the lease. The next
+  // lease holder checkpoints/reconciles it before any new observations or sends.
 }
 
 export async function monitorStatus(env) {
@@ -822,6 +896,7 @@ export async function monitorStatus(env) {
     stateValid: true,
     lastCheckAt: state.last_check_at ?? null,
     lastRun: state.monitor_last_run ?? null,
+    delivery: await monitorDeliveryStatus(env.MONITOR_DB),
     checks: trackerEntries(state).filter(({ tracker }) => !tracker.removed_at).map(({ tracker }) => ({
       summoner: tracker.summoner.riot_id,
       completedAt: tracker.completed_checked_at ?? null,
@@ -945,6 +1020,7 @@ export async function runLeagueMonitor(env, options = {}) {
   try {
     previous = await readState(env.MONITOR_DB);
     const state = structuredClone(previous);
+    await recoverMonitorDelivery(env.MONITOR_DB, owner, state);
     const keyFingerprint = await riotKeyFingerprint(env.RIOT_API_KEY);
     const keyChanged = state.riot_key_fingerprint !== keyFingerprint;
     state.riot_key_fingerprint = keyFingerprint;

@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { riotKeyFingerprint } from "../src/riot-key.js";
-import { resolveTrackedAccount, runLeagueMonitor } from "../src/monitor.js";
+import { resolveTrackedAccount, runLeagueMonitor, readState } from "../src/monitor.js";
+import { testDb } from "./helpers/db.js";
 import { buildRecentResponse } from "../src/index.js";
 
 const at = "2026-09-06T05:45:00.000Z";
@@ -79,13 +80,9 @@ test("expired credentials do not trigger identity rebinding", async (t) => {
 });
 
 for (const fail of [false, true]) test(`monitor key migration ${fail ? "failure preserves all durable state" : "refreshes all three identities without new alerts"}`, async (t) => {
-  let stored = JSON.stringify({ ...tracker(), riot_key_fingerprint: "previous", additional_summoners: { b: tracker("B", 2), c: tracker("C", 3) } });
-  const before = stored;
-  const original = JSON.parse(before);
-  const db = { prepare(sql) { return { bind(...args) { return {
-    first: async () => ({ state_json: stored }),
-    run: async () => { if (sql.includes("SET state_json")) stored = args[0]; return { meta: { changes: 1 } }; },
-  }; } }; } };
+  t.mock.method(Date, "now", () => Date.parse(at));
+  const original = { ...tracker(), riot_key_fingerprint: "previous", additional_summoners: { b: tracker("B", 2), c: tracker("C", 3) } };
+  const db = testDb(original);
   t.mock.method(globalThis, "fetch", async (input) => {
     const url = String(input);
     assert.ok(!url.includes("discord.com"), "Migration must not POST historical alerts");
@@ -107,10 +104,10 @@ for (const fail of [false, true]) test(`monitor key migration ${fail ? "failure 
   const run = runLeagueMonitor({ MONITOR_ENABLED: "true", MONITOR_DB: db, RIOT_API_KEY: "synthetic-key", DISCORD_BOT_TOKEN: "synthetic-bot", DISCORD_ALERT_CHANNEL_ID: "123" }, { detectionTimestamp: Date.parse(at) });
   if (fail) {
     await assert.rejects(run, /HTTP 503/);
-    assert.equal(stored, before);
+    assert.deepEqual(await readState(db), original);
   } else {
     assert.equal((await run).newAlerts, 0);
-    const state = JSON.parse(stored);
+    const state = await readState(db);
     assert.equal(state.riot_key_fingerprint, await riotKeyFingerprint("synthetic-key"));
     for (const [current, old] of [[state, original], [state.additional_summoners.b, original.additional_summoners.b], [state.additional_summoners.c, original.additional_summoners.c]]) {
       assert.ok(current.summoner.puuid.startsWith("new-"));
@@ -118,7 +115,7 @@ for (const fail of [false, true]) test(`monitor key migration ${fail ? "failure 
       assert.deepEqual(current.newest_completed_match, old.newest_completed_match);
       assert.deepEqual(current.baseline, old.baseline);
     }
-    assert.ok(!stored.includes("synthetic-key"));
+    assert.ok(!JSON.stringify(state).includes("synthetic-key"));
   }
 });
 

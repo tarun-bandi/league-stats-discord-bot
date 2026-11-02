@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { testDb } from "./helpers/db.js";
 
 import { COMMANDS, MONITORED_SUMMONER_DEFAULTS } from "../src/commands.js";
 import {
@@ -58,21 +59,7 @@ test("autocomplete response reads current Riot IDs from monitor state", async ()
       "na:renamed#na1": tracker("Renamed Account#NA1"),
     },
   };
-  const env = {
-    MONITOR_DB: {
-      prepare() {
-        return {
-          bind() {
-            return {
-              async first() {
-                return { state_json: JSON.stringify(state) };
-              },
-            };
-          },
-        };
-      },
-    },
-  };
+  const env = { MONITOR_DB: testDb(state) };
 
   const response = await autocompleteResponse(
     {

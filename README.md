@@ -259,6 +259,66 @@ committed monitor tick, not proof that every source succeeded. The 9–5 report 
 when game observations are incomplete. Authentication, unexpected source, and Discord
 failures still prevent the affected invocation from committing authoritative state.
 
+### Alert delivery and replay protection
+
+The monitor validates all grouped payloads and applies completion edits before
+creating a new alert. A failed edit cannot repeatedly announce the same new games.
+Discord `404` with code `10008` (Unknown Message) is recorded as a deleted alert:
+its message ID and game history remain, and the bot never recreates it. Missing
+channels, missing permissions, throttling and other errors are not treated as
+deleted messages.
+
+Before creating a message, the monitor writes a non-expiring `monitor:delivery`
+attempt in the existing `bot_records` table, under its D1 monitor lease. After
+Discord accepts the message, it stores the returned ID in that receipt before
+saving the main monitor state. The next lease holder restores delivered records
+before any Riot lookups or new alerts, preserving roster changes, cursors and
+newer completion details. The last receipt is cleared only after this checkpoint;
+no database migration or new secret is required.
+
+`/monitor/status` includes `delivery.status`:
+
+- `idle`: no outstanding receipt.
+- `checkpoint_pending`: a known sent message will be reconciled on the next tick
+  (also normal briefly after a successful alert).
+- `needs_review`: the POST outcome is unknown; automatic monitor sends and source
+  checks are blocked until the receipt is reconciled. The original state remains.
+
+Explicit Discord POST rejections can retry on the next tick. A timeout, 5xx,
+malformed success response, or crash before the message ID is recorded leaves the
+attempt in place indefinitely. This deliberately favors avoiding duplicate alerts
+over automatic retries that might deliver a second copy. A nonce with
+`enforce_nonce` is sent as additional protection, but [Discord checks nonce
+uniqueness only for a few minutes](https://docs.discord.com/developers/resources/message#create-message);
+it is not permanent exactly-once delivery.
+
+The nonce is a 24-character SHA-256 prefix of a versioned, sorted batch of
+`(stateKey, collection, recordKey, status)` plus the destination channel. Rebuilding
+the same batch gives the same nonce even if item order or game detection text
+changes. This can suppress an accidentally recreated batch inside Discord's
+window, but adds no long-term guarantee beyond the D1 receipt and saved history.
+Changed batch membership, lifecycle status or channel produces a new nonce.
+Rank record keys currently include detection time, so re-observing the same rank
+transition at a different time also produces a new nonce. We intentionally do not
+collapse repeated rank transitions by rank labels alone. The 96-bit hash is
+collision-resistant defense in depth, not an exactly-once identity ledger.
+
+**Operator recovery:** see the [guarded SQL runbook, downtime estimate and player impact](docs/monitor-delivery-recovery.md). In brief, disable `MONITOR_ENABLED`, wait for any in-flight lease to
+end, and back up `monitor_state` and the `monitor:delivery` row. Inspect that row's
+channel, attempt time and game/rank entries against the bot-authored Discord
+message. If delivery is confirmed, update only that receipt's `status` to `sent`
+and `messageId` to the verified message ID, preserving its nonce and entries.
+Re-enable monitoring: it checkpoints the receipt before continuing. Only remove an
+uncertain attempt if non-delivery has been established; never clear it merely to
+make retries start again. An absent message in a partial history view is not proof
+of non-delivery. A corrupt/conflicting receipt requires investigation, not a state
+reset. No recovery operation should erase reported-game maps or move cursors.
+
+This protection cannot reconstruct IDs lost by older releases. When deploying
+after a repeat-alert incident, reconcile already-posted games against saved history
+before resuming to avoid one final catch-up announcement. The change does not delete
+existing duplicate Discord messages or modify the paused legacy webhook monitor.
+
 `/track alerts mode:Completed only` suppresses new live announcements but retains
 completion and demotion alerts. `Live + completed` restores the original policy.
 The slash commands can query other regions/accounts without enrolling them.
