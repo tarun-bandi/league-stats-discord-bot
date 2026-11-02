@@ -6,6 +6,17 @@ const LEASE_MS = 4 * 60_000;
 
 export const readMonitorDelivery = (db) => readRecord(db, KEY);
 
+// Stable for the same destination and exact record batch, independent of order
+// or presentation changes (rank record keys still include detection time). This is only short-window defense in
+// depth; the non-expiring receipt remains the authority for ambiguous sends.
+export async function monitorDeliveryNonce(channelId, items) {
+  const identities = items.map(({ stateKey, collection, recordKey, record }) =>
+    JSON.stringify([stateKey, collection, recordKey, record.status])).sort();
+  const input = JSON.stringify(["monitor-delivery-v1", String(channelId), identities]);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input)));
+  return Array.from(digest.slice(0, 12), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 // Every mutation is fenced by the monitor lease. Receipts never expire: Discord's
 // nonce window is finite, so a timeout/crash cannot safely become a fresh POST.
 export async function renewMonitorDeliveryLease(db, owner) {

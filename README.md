@@ -292,7 +292,18 @@ over automatic retries that might deliver a second copy. A nonce with
 uniqueness only for a few minutes](https://docs.discord.com/developers/resources/message#create-message);
 it is not permanent exactly-once delivery.
 
-**Operator recovery:** disable `MONITOR_ENABLED`, wait for any in-flight lease to
+The nonce is a 24-character SHA-256 prefix of a versioned, sorted batch of
+`(stateKey, collection, recordKey, status)` plus the destination channel. Rebuilding
+the same batch gives the same nonce even if item order or game detection text
+changes. This can suppress an accidentally recreated batch inside Discord's
+window, but adds no long-term guarantee beyond the D1 receipt and saved history.
+Changed batch membership, lifecycle status or channel produces a new nonce.
+Rank record keys currently include detection time, so re-observing the same rank
+transition at a different time also produces a new nonce. We intentionally do not
+collapse repeated rank transitions by rank labels alone. The 96-bit hash is
+collision-resistant defense in depth, not an exactly-once identity ledger.
+
+**Operator recovery:** see the [guarded SQL runbook, downtime estimate and player impact](docs/monitor-delivery-recovery.md). In brief, disable `MONITOR_ENABLED`, wait for any in-flight lease to
 end, and back up `monitor_state` and the `monitor:delivery` row. Inspect that row's
 channel, attempt time and game/rank entries against the bot-authored Discord
 message. If delivery is confirmed, update only that receipt's `status` to `sent`

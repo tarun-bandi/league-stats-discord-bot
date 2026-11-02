@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { acquireLease, commitMonitorChanges, readState, recoverMonitorDelivery, releaseLease, runLeagueMonitor, monitorStatus } from "../src/monitor.js";
-import { readMonitorDelivery } from "../src/monitor-delivery.js";
+import { readFileSync } from "node:fs";
+import { monitorDeliveryNonce, readMonitorDelivery } from "../src/monitor-delivery.js";
 import { observeRanks } from "../src/ranks.js";
 import { testDb, stateFixture, envFixture, game } from "./helpers/db.js";
 
@@ -234,4 +235,77 @@ test("recovering a grouped demotion restores its baseline so it is not alerted a
   assert.deepEqual(observeRanks(state, ranked("III"), new Date(now + 60_000).toISOString()), []);
   assert.equal(Object.values(state.reported_rank_changes)[0].discord_message_id, "999");
   assert.equal(state.additional_summoners.b.reported_games.NA1_200.discord_message_id, "999");
+});
+
+
+test("batch nonce is stable across order and presentation changes but scoped to identities and destination", async () => {
+  const items = [
+    { stateKey: "a", collection: "reported_games", recordKey: "NA1_200", record: completed(200) },
+    { stateKey: "b", collection: "reported_rank_changes", recordKey: `solo:${at}:GOLD:III`, record: { kind: "demotion", status: "completed" } },
+  ];
+  const nonce = await monitorDeliveryNonce("789", items);
+  assert.match(nonce, /^[a-f0-9]{24}$/);
+  const reordered = structuredClone(items).reverse();
+  reordered[1].record.detected_at = "2026-11-02T00:00:00Z";
+  reordered[1].record.champion_icon_url = "https://example.invalid/new-icon";
+  assert.equal(await monitorDeliveryNonce("789", reordered), nonce);
+  assert.notEqual(await monitorDeliveryNonce("790", items), nonce);
+  assert.notEqual(await monitorDeliveryNonce("789", items.slice(0, 1)), nonce);
+  for (const [field, value] of [["stateKey", "c"], ["collection", "reported_rank_changes"], ["recordKey", "NA1_201"]]) {
+    const changed = structuredClone(items);
+    changed[0][field] = value;
+    assert.notEqual(await monitorDeliveryNonce("789", changed), nonce);
+  }
+  const live = structuredClone(items);
+  live[0].record.status = "live";
+  assert.notEqual(await monitorDeliveryNonce("789", live), nonce);
+  // Rank keys include observation time: this is deliberately NOT event-level
+  // deduplication for a regenerated rank transition or a regrouped batch.
+  const laterRank = structuredClone(items);
+  laterRank[1].recordKey = "solo:2026-11-02T00:00:00Z:GOLD:III";
+  assert.notEqual(await monitorDeliveryNonce("789", laterRank), nonce);
+});
+
+test("a recreated batch reuses its nonce while an outstanding receipt still blocks POST", async (t) => {
+  const { db, plan, env } = await fixture(t);
+  plan.patchTargets.clear();
+  const nonces = [];
+  const fetchImpl = async (_url, init) => {
+    nonces.push(JSON.parse(init.body).nonce);
+    return nonces.length === 1 ? new Response(null, { status: 429 }) : Response.json({ id: "999" });
+  };
+  await assert.rejects(commitMonitorChanges(env, structuredClone(plan), { fetchImpl }), /HTTP 429/);
+  await assert.rejects(commitMonitorChanges(env, structuredClone(plan), {
+    fetchImpl, saveStateImpl: async () => { throw new Error("D1 unavailable"); },
+  }), /D1 unavailable/);
+  assert.equal(nonces[0], nonces[1]);
+  assert.equal(nonces[1], (await readMonitorDelivery(db)).nonce);
+  await assert.rejects(commitMonitorChanges(env, structuredClone(plan), { fetchImpl }), /must be recovered/);
+  assert.equal(nonces.length, 2);
+});
+
+test("documented confirmed-send SQL rejects stale/live attempts and recovery never reposts", async (t) => {
+  const { db, initial, plan, env } = await fixture(t);
+  plan.patchTargets.clear();
+  await assert.rejects(commitMonitorChanges(env, plan, { fetchImpl: async () => { throw new Error("timeout"); } }), /timeout/);
+  const receipt = await readMonitorDelivery(db);
+  const runbook = readFileSync(new URL("../docs/monitor-delivery-recovery.md", import.meta.url), "utf8");
+  const template = runbook.match(/```sql\n   (UPDATE bot_records[\s\S]*?)\n   ```/)[1];
+  const sql = (nonce = receipt.nonce) => template.replace("VERIFIED_MESSAGE_ID", "999")
+    .replace("EXPECTED_NONCE", nonce).replace("EXPECTED_ATTEMPT_AT", at);
+  const wallNow = db.sqlite.prepare("SELECT unixepoch('now') * 1000 AS now").get().now;
+  db.sqlite.prepare("UPDATE monitor_state SET lease_until=?").run(wallNow + 60_000);
+  assert.equal(db.sqlite.prepare(sql()).get(), undefined, "live lease blocks operator update");
+  await releaseLease(db, "owner");
+  assert.equal(db.sqlite.prepare(sql("stale-nonce")).get(), undefined);
+  assert.equal(db.sqlite.prepare(sql().replace(at, "2000-01-01T00:00:00Z")).get(), undefined);
+  const updated = JSON.parse(db.sqlite.prepare(sql()).get().payload);
+  assert.deepEqual(updated, { ...receipt, status: "sent", messageId: "999" });
+  assert.deepEqual(await readState(db), initial, "operator only updates the receipt");
+  assert.equal(db.sqlite.prepare(sql()).get(), undefined, "already-sent receipt is not overwritten");
+  t.mock.method(globalThis, "fetch", async () => { throw new Error("recovery must not POST"); });
+  await acquireLease(db, now, "recovery");
+  await recoverMonitorDelivery(db, "recovery", await readState(db));
+  assert.equal((await readState(db)).additional_summoners.b.reported_games.NA1_200.discord_message_id, "999");
+  assert.equal(await readMonitorDelivery(db), null);
 });

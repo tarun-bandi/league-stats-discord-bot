@@ -8,7 +8,7 @@ import { riotKeyFingerprint } from "./riot-key.js";
 import { reportCredentialHealth, confirmCredentialFailure } from "./health.js";
 import { rememberWorkdayGame } from "./workday.js";
 import { RiotRateLimitError } from "./errors.js";
-import { readMonitorDelivery, prepareMonitorDelivery, saveMonitorDelivery, clearMonitorDelivery, monitorDeliveryStatus, renewMonitorDeliveryLease } from "./monitor-delivery.js";
+import { readMonitorDelivery, prepareMonitorDelivery, saveMonitorDelivery, clearMonitorDelivery, monitorDeliveryStatus, renewMonitorDeliveryLease, monitorDeliveryNonce } from "./monitor-delivery.js";
 
 const STATE_KEY = "league-game-monitor";
 const DISCORD_API = "https://discord.com/api/v10";
@@ -857,8 +857,9 @@ export async function commitMonitorChanges(
     }
   }
   if (newAlerts.length) {
-    const delivery = { status: "sending", nonce: crypto.randomUUID().slice(0, 24),
-      channelId: botChannelId(env), attemptedAt: detectionIso, items };
+    const channelId = botChannelId(env);
+    const delivery = { status: "sending", nonce: await monitorDeliveryNonce(channelId, items),
+      channelId, attemptedAt: detectionIso, items };
     await prepareMonitorDelivery(env.MONITOR_DB, owner, delivery);
     let messageId;
     try { messageId = await postDiscordBot(env, newAlerts, fetchImpl, delivery.nonce); }
